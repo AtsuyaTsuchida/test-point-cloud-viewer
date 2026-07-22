@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.npz
+*.ply
+.DS_Store
+nohup.out

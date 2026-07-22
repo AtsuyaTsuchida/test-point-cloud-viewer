@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>LiDAR 点群ビューア — OS-DOME-128</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#ddd;
+    font:13px/1.5 "Hiragino Sans","Noto Sans JP",sans-serif;}
+  #cv{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab;}
+  #cv.drag{cursor:grabbing;}
+  #panel{position:absolute;top:12px;left:12px;width:230px;background:rgba(16,18,26,.88);
+    border:1px solid #2a2e3e;border-radius:10px;padding:12px 14px;backdrop-filter:blur(6px);
+    user-select:none;}
+  #panel h1{font-size:13px;margin:0 0 2px;color:#fff;font-weight:600;}
+  #panel .sub{color:#7a8199;font-size:11px;margin-bottom:10px;}
+  .row{display:flex;align-items:center;justify-content:space-between;margin:7px 0;gap:8px;}
+  .row label{color:#aab;white-space:nowrap;}
+  select,button{background:#232736;color:#dde;border:1px solid #3a4058;border-radius:6px;
+    padding:3px 8px;font:inherit;font-size:12px;}
+  select{max-width:130px;}
+  button{cursor:pointer;}
+  button:hover{background:#2e3448;}
+  input[type=range]{width:120px;accent-color:#e66a4e;}
+  input[type=checkbox]{accent-color:#e66a4e;}
+  #stats{color:#7a8199;font-size:11px;margin-top:10px;border-top:1px solid #2a2e3e;padding-top:8px;}
+  #bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:12px;
+    padding:10px 16px;background:rgba(12,14,20,.9);border-top:1px solid #23273a;}
+  #play{width:44px;height:32px;font-size:15px;}
+  #seek{flex:1;accent-color:#e66a4e;}
+  #time{font-variant-numeric:tabular-nums;color:#cbd;min-width:120px;text-align:right;}
+  #speed{width:64px;}
+  #buffering{position:absolute;top:14px;right:16px;background:rgba(20,22,32,.85);
+    border:1px solid #3a4058;border-radius:8px;padding:5px 12px;color:#ffb37a;
+    display:none;font-size:12px;}
+  #help{position:absolute;bottom:56px;right:16px;color:#5a6079;font-size:11px;text-align:right;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="panel">
+  <h1 id="ttl">LiDAR 点群ビューア</h1>
+  <div class="sub" id="sub">読み込み中…</div>
+  <div class="row"><label>描画</label>
+    <select id="rmode">
+      <option value="1" selected>スプラット</option>
+      <option value="0">点</option>
+    </select></div>
+  <div class="row"><label>カラー</label>
+    <select id="mode">
+      <option value="0" selected>反射率</option>
+      <option value="1">信号強度</option>
+      <option value="2">近赤外</option>
+      <option value="3">高さ (Z)</option>
+      <option value="4">距離</option>
+    </select></div>
+  <div class="row"><label>カラーマップ</label>
+    <select id="cmap">
+      <option value="0" selected>Magma</option>
+      <option value="1">Inferno</option>
+      <option value="2">Viridis</option>
+      <option value="3">Turbo</option>
+      <option value="4">グレー</option>
+    </select></div>
+  <div class="row"><label>自動レベル</label><input type="checkbox" id="autolvl" checked></div>
+  <div class="row"><label>点サイズ</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
+  <div class="row"><label>スプラット径</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.1" value="1.2"></div>
+  <div class="row"><label>不透明度</label><input type="range" id="opac" min="0.3" max="1" step="0.05" value="1"></div>
+  <div class="row"><label>距離減衰</label><input type="checkbox" id="atten" checked></div>
+  <div class="row"><label>距離リング</label><input type="checkbox" id="rings" checked></div>
+  <div class="row">
+    <button id="resetcam">視点リセット</button>
+    <button id="ply">PLY書き出し</button>
+  </div>
+  <div class="row">
+    <button id="gsply" style="width:100%">3DGS PLY書き出し (現フレーム)</button>
+  </div>
+  <div id="stats">–</div>
+</div>
+
+<div id="buffering">● バッファ中…</div>
+<div id="help">ドラッグ: 回転 / 右ドラッグ・Shift: 移動 / ホイール: ズーム<br>
+Space: 再生 / ←→: コマ送り (Shiftで±20)</div>
+
+<div id="bar">
+  <button id="play">▶</button>
+  <input type="range" id="seek" min="0" max="0" step="1" value="0">
+  <select id="speed">
+    <option value="0.25">0.25x</option><option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option><option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+  <div id="time">--:-- / --:--</div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// ---------- WebGL ----------
+const canvas = $("cv");
+const gl = canvas.getContext("webgl2", {antialias:false});
+if (!gl) { document.body.innerHTML = "WebGL2が使えません"; throw 0; }
+
+function compile(vs, fs){
+  const mk = (t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+    if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o;};
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+  return p;
+}
+
+const CMAP_GLSL = `
+vec3 magma(float t){
+  const vec3 c0=vec3(-0.002136,-0.000750,-0.005386),c1=vec3(0.251661,0.677523,2.494027),
+  c2=vec3(8.353717,-3.577720,0.314468),c3=vec3(-27.668733,14.264731,-13.649213),
+  c4=vec3(52.176140,-27.943606,12.944169),c5=vec3(-50.768525,29.046583,4.234153),
+  c6=vec3(18.655705,-11.489774,-5.601962);
+  return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));}
+vec3 inferno(float t){
+  const vec3 c0=vec3(0.000219,0.001651,-0.019481),c1=vec3(0.106513,0.563956,3.932712),
+  c2=vec3(11.602493,-3.972854,-15.942394),c3=vec3(-41.703996,17.436399,44.354145),
+  c4=vec3(77.162936,-33.402359,-81.807309),c5=vec3(-71.319428,32.626064,73.209520),
+  c6=vec3(25.131126,-12.242669,-23.070325);
+  return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));}
+vec3 viridis(float t){
+  const vec3 c0=vec3(0.277727,0.005407,0.334100),c1=vec3(0.105093,1.404614,1.384590),
+  c2=vec3(-0.330862,0.214848,0.095095),c3=vec3(-4.634230,-5.799101,-19.332441),
+  c4=vec3(6.228270,14.179933,56.690553),c5=vec3(4.776385,-13.745145,-65.353033),
+  c6=vec3(-5.435456,4.645853,26.312435);
+  return c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6)))));}
+vec3 turbo(float t){
+  const vec4 kR=vec4(0.13572138,4.61539260,-42.66032258,132.13108234),
+  kG=vec4(0.09140261,2.19418839,4.84296658,-14.18503333),
+  kB=vec4(0.10667330,12.64194608,-60.58204836,110.36276771);
+  const vec2 kR2=vec2(-152.94239396,59.28637943),kG2=vec2(4.27729857,2.82956604),
+  kB2=vec2(-89.90310912,27.34824973);
+  vec4 v4=vec4(1.0,t,t*t,t*t*t); vec2 v2=v4.zw*v4.z;
+  return vec3(dot(v4,kR)+dot(v2,kR2),dot(v4,kG)+dot(v2,kG2),dot(v4,kB)+dot(v2,kB2));}
+vec3 cmap(int c, float t){
+  t = clamp(t, 0.0, 1.0);
+  if(c==0) return magma(t);
+  if(c==1) return inferno(t);
+  if(c==2) return viridis(t);
+  if(c==3) return turbo(t);
+  return vec3(t);}
+`;
+
+const ptProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; in float aRefl; in float aSig; in float aNir;
+uniform mat4 uProj, uView;
+uniform float uPointSize, uLo, uHi, uAtten, uDpr;
+uniform int uMode;
+out float vT;
+void main(){
+  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; return; }
+  vec4 eye = uView * vec4(aPos,1.0);
+  gl_Position = uProj * eye;
+  float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
+            (uMode==3)?aPos.z : length(aPos);
+  vT = (v - uLo) / max(uHi - uLo, 1e-6);
+  float s = uPointSize;
+  if (uAtten > 0.5) s = uPointSize * 6.0 / max(-eye.z, 0.8);
+  gl_PointSize = clamp(s, 1.0, 30.0) * uDpr;
+}`,`#version 300 es
+precision highp float;
+in float vT; uniform int uCmap; out vec4 frag;
+${CMAP_GLSL}
+void main(){
+  vec2 d = gl_PointCoord - 0.5;
+  if (dot(d,d) > 0.25) discard;
+  frag = vec4(cmap(uCmap, vT), 1.0);
+}`);
+
+// サーフェル(楕円ガウシアン)スプラット描画
+const splatProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; in float aRefl; in float aSig; in float aNir;
+in vec2 aNrm; in float aRad;
+uniform mat4 uProj, uView;
+uniform float uLo, uHi, uRadMul, uFocal, uDpr;
+uniform int uMode;
+out float vT; out vec3 vC; out vec3 vN; out float vR;
+vec3 octDecode(vec2 e){
+  vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+  if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
+  return normalize(v);
+}
+void main(){
+  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vR=0.0; return; }
+  vec4 eye = uView * vec4(aPos,1.0);
+  gl_Position = uProj * eye;
+  float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
+            (uMode==3)?aPos.z : length(aPos);
+  vT = (v - uLo) / max(uHi - uLo, 1e-6);
+  float r = 0.004 * pow(1.0182, aRad*255.0) * uRadMul;
+  vR = r; vC = eye.xyz;
+  vN = mat3(uView) * octDecode(aNrm);
+  float rpx = r * uFocal / max(-eye.z, 0.05);
+  gl_PointSize = clamp(rpx*4.0, 2.0, 120.0) * uDpr;
+}`,`#version 300 es
+precision highp float;
+in float vT; in vec3 vC; in vec3 vN; in float vR;
+uniform vec2 uVp; uniform vec2 uPxy;
+uniform int uCmap; uniform float uOpacity;
+out vec4 frag;
+${CMAP_GLSL}
+void main(){
+  vec2 ndc = (gl_FragCoord.xy / uVp) * 2.0 - 1.0;
+  vec3 d = vec3(ndc.x/uPxy.x, ndc.y/uPxy.y, -1.0);
+  float nd = dot(vN, d);
+  float dist2;
+  if (abs(nd) > 0.12 * length(d)) {
+    // 接平面との交点までの面内距離 → 遠近で正しく歪む楕円になる
+    float t = dot(vN, vC) / nd;
+    if (t < 0.0) discard;
+    vec3 q = d*t - vC;
+    dist2 = dot(q,q);
+  } else {
+    // ほぼ真横から見た面はビルボードにフォールバック
+    vec3 dn = normalize(d);
+    vec3 q = vC - dn*dot(vC,dn);
+    dist2 = dot(q,q);
+  }
+  float sg = vR * 0.65;
+  float u2 = dist2/(sg*sg);
+  float a = exp(-0.5 * u2*u2) * uOpacity;   // 中心が平坦なスーパーガウシアン
+  if (a < 0.03) discard;
+  frag = vec4(cmap(uCmap, clamp(vT,0.0,1.0)) * a, a);
+}`);
+
+const lineProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; uniform mat4 uProj,uView;
+void main(){ gl_Position = uProj * uView * vec4(aPos,1.0); }`,
+`#version 300 es
+precision highp float; uniform vec4 uColor; out vec4 frag;
+void main(){ frag = uColor; }`);
+
+// ---------- 行列 ----------
+function perspective(fovy, aspect, near, far){
+  const f = 1/Math.tan(fovy/2), nf = 1/(near-far);
+  return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
+}
+function lookAt(eye, tgt, up){
+  const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+  const nrm=a=>{const l=Math.hypot(...a);return [a[0]/l,a[1]/l,a[2]/l];};
+  const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+  const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const z = nrm(sub(eye,tgt)), x = nrm(cross(up,z)), y = cross(z,x);
+  return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+    -dot(x,eye),-dot(y,eye),-dot(z,eye),1]);
+}
+
+// ---------- カメラ ----------
+const cam = { yaw:-1.0, pitch:0.35, dist:9, tgt:[0,0,1.6] };
+function resetCam(){ cam.yaw=-1.0; cam.pitch=0.35; cam.dist=9; cam.tgt=[0,0,1.6]; }
+function viewMatrix(){
+  const cp=Math.cos(cam.pitch), sp=Math.sin(cam.pitch);
+  const eye=[cam.tgt[0]+cam.dist*cp*Math.cos(cam.yaw),
+             cam.tgt[1]+cam.dist*cp*Math.sin(cam.yaw),
+             cam.tgt[2]+cam.dist*sp];
+  return {v:lookAt(eye,cam.tgt,[0,0,1]), eye};
+}
+let dragBtn=-1, lastX=0, lastY=0;
+canvas.addEventListener("pointerdown",e=>{dragBtn=e.button; lastX=e.clientX; lastY=e.clientY;
+  canvas.setPointerCapture(e.pointerId); canvas.classList.add("drag");});
+canvas.addEventListener("pointerup",e=>{dragBtn=-1; canvas.classList.remove("drag");});
+canvas.addEventListener("contextmenu",e=>e.preventDefault());
+canvas.addEventListener("pointermove",e=>{
+  if(dragBtn<0) return;
+  const dx=e.clientX-lastX, dy=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY;
+  if(dragBtn===0 && !e.shiftKey){
+    cam.yaw -= dx*0.006;
+    cam.pitch = Math.min(1.55, Math.max(-1.55, cam.pitch + dy*0.006));
+  } else {
+    const s = cam.dist*0.0016;
+    const cy=Math.cos(cam.yaw), sy=Math.sin(cam.yaw);
+    // 画面右 = [-sy, cy], 画面上(水平面) = カメラ前方の反対
+    cam.tgt[0] += (-sy*-dx - cy*dy*Math.sin(cam.pitch))*s;
+    cam.tgt[1] += ( cy*-dx - sy*dy*Math.sin(cam.pitch))*s;
+    cam.tgt[2] += dy*Math.cos(cam.pitch)*s;
+  }
+});
+canvas.addEventListener("wheel",e=>{
+  e.preventDefault();
+  cam.dist = Math.min(80, Math.max(0.5, cam.dist*Math.exp(e.deltaY*0.0012)));
+},{passive:false});
+
+// ---------- バッファ ----------
+let N=0, vao=null, posVBO, reflVBO, sigVBO, nirVBO, nrmVBO, radVBO, idxVBO;
+function initBuffers(n){
+  N=n;
+  vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const mk=(idx,size,type,norm,bytes)=>{
+    const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+    gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(idx); gl.vertexAttribPointer(idx,size,type,norm,0,0);
+    return b;};
+  posVBO = mk(0,3,gl.FLOAT,false,n*12);
+  reflVBO= mk(1,1,gl.UNSIGNED_BYTE,true,n);
+  sigVBO = mk(2,1,gl.UNSIGNED_SHORT,true,n*2);
+  nirVBO = mk(3,1,gl.UNSIGNED_SHORT,true,n*2);
+  nrmVBO = mk(4,2,gl.BYTE,true,n*2);
+  radVBO = mk(5,1,gl.UNSIGNED_BYTE,true,n);
+  idxVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxVBO);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, n*4, gl.DYNAMIC_DRAW);
+  gl.bindVertexArray(null);
+}
+for (const p of [ptProg, splatProg]){
+  gl.bindAttribLocation(p,0,"aPos"); gl.bindAttribLocation(p,1,"aRefl");
+  gl.bindAttribLocation(p,2,"aSig"); gl.bindAttribLocation(p,3,"aNir");
+  gl.bindAttribLocation(p,4,"aNrm"); gl.bindAttribLocation(p,5,"aRad");
+  gl.linkProgram(p);
+}
+
+function upload(fr){
+  const up=(b,arr)=>{gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferSubData(gl.ARRAY_BUFFER,0,arr);};
+  up(posVBO,fr.pos); up(reflVBO,fr.refl); up(sigVBO,fr.sig); up(nirVBO,fr.nir);
+  up(nrmVBO,fr.nrm); up(radVBO,fr.rad);
+}
+
+// ---------- 深度ソート(スプラットのαブレンド用, 基数ソート) ----------
+let sIdx=null, sTmp=null, sKeys=null, sCnt=null, lastSort=null;
+function sortSplats(fr, view){
+  const n = fr.n;
+  if (!sIdx || sIdx.length!==n){
+    sIdx=new Uint32Array(n); sTmp=new Uint32Array(n);
+    sKeys=new Uint16Array(n); sCnt=new Uint32Array(256);
+  }
+  const vx=view[2], vy=view[6], vz=view[10], vw=view[14];
+  for (let i=0;i<n;i++){
+    const p=i*3;
+    const d = -(vx*fr.pos[p]+vy*fr.pos[p+1]+vz*fr.pos[p+2]+vw);   // 手前ほど小
+    let k = (d*650)|0;                                            // ~100mで飽和
+    k = k<0?0 : k>65535?65535 : k;
+    sKeys[i] = 65535-k;                                           // 奥→手前の昇順キー
+  }
+  sCnt.fill(0);
+  for (let i=0;i<n;i++) sCnt[sKeys[i]&255]++;
+  for (let i=1;i<256;i++) sCnt[i]+=sCnt[i-1];
+  for (let i=n-1;i>=0;i--) sTmp[--sCnt[sKeys[i]&255]] = i;
+  sCnt.fill(0);
+  for (let i=0;i<n;i++) sCnt[sKeys[i]>>8]++;
+  for (let i=1;i<256;i++) sCnt[i]+=sCnt[i-1];
+  for (let i=n-1;i>=0;i--){ const j=sTmp[i]; sIdx[--sCnt[sKeys[j]>>8]] = j; }
+  gl.bindVertexArray(vao);
+  gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, sIdx);
+  gl.bindVertexArray(null);
+}
+function needResort(frame){
+  const sig = [frame, cam.yaw.toFixed(3), cam.pitch.toFixed(3),
+               cam.dist.toFixed(2), cam.tgt.map(v=>v.toFixed(2)).join()].join("|");
+  if (sig===lastSort) return false;
+  lastSort = sig; return true;
+}
+
+// ---------- 距離リング ----------
+let ringVBO=null, ringCount=0;
+function initRings(){
+  const v=[]; const SEG=96;
+  for(let r=1;r<=14;r++)
+    for(let s=0;s<SEG;s++){
+      const a0=s/SEG*2*Math.PI, a1=(s+1)/SEG*2*Math.PI;
+      v.push(r*Math.cos(a0),r*Math.sin(a0),0, r*Math.cos(a1),r*Math.sin(a1),0);
+    }
+  v.push(-14,0,0, 14,0,0, 0,-14,0, 0,14,0);
+  ringVBO=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,ringVBO);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);
+  ringCount=v.length/3;
+}
+initRings();
+
+// ---------- フレームキャッシュ & 先読み ----------
+const cache = new Map();          // idx -> {pos,refl,sig,nir,t}
+const order = [];                 // LRU
+const MAX_CACHE = 280;            // ≈ 600MB
+const inflight = new Map();       // idx -> Promise
+let INFO=null;
+
+function parseFrame(buf){
+  const dv = new DataView(buf);
+  const n = dv.getUint32(4,true);
+  const t = dv.getFloat32(8,true);
+  let o = 16;
+  const pos = new Float32Array(buf,o,n*3); o += n*12;
+  const refl= new Uint8Array(buf,o,n);     o += n;
+  const sig = new Uint16Array(buf,o,n);    o += n*2;
+  const nir = new Uint16Array(buf,o,n);    o += n*2;
+  const nrm = new Int8Array(buf,o,n*2);    o += n*2;
+  const rad = new Uint8Array(buf,o,n);
+  return {pos,refl,sig,nir,nrm,rad,t,n};
+}
+function getFrame(i){
+  if (cache.has(i)) {
+    const k=order.indexOf(i); if(k>=0) order.splice(k,1); order.push(i);
+    return Promise.resolve(cache.get(i));
+  }
+  if (inflight.has(i)) return inflight.get(i);
+  const p = fetch("/frame/"+i).then(r=>{
+    if(!r.ok) throw new Error("frame "+i);
+    return r.arrayBuffer();
+  }).then(buf=>{
+    const fr = parseFrame(buf);
+    cache.set(i, fr); order.push(i);
+    while (order.length > MAX_CACHE){ cache.delete(order.shift()); }
+    inflight.delete(i);
+    return fr;
+  }).catch(e=>{ inflight.delete(i); throw e; });
+  inflight.set(i, p);
+  return p;
+}
+function prefetch(from){
+  if(!INFO) return;
+  const AHEAD = 36, PAR = 4;
+  let launched = inflight.size;
+  for(let d=0; d<AHEAD && launched<PAR; d++){
+    const i = from + d;
+    if (i >= INFO.n_frames) break;
+    if (!cache.has(i) && !inflight.has(i)){ getFrame(i).catch(()=>{}); launched++; }
+  }
+}
+
+// ---------- 自動レベル ----------
+const levels = {lo:0, hi:1};
+function computeLevels(fr, mode){
+  const SAMP = 4096, vals=[];
+  const n = fr.n;
+  for(let k=0;k<SAMP;k++){
+    const i = ((k*2654435761)>>>0) % n;
+    let v;
+    if(mode===0) v=fr.refl[i]/255;
+    else if(mode===1) v=fr.sig[i]/65535;
+    else if(mode===2) v=fr.nir[i]/65535;
+    else if(mode===3) v=fr.pos[i*3+2];
+    else { const x=fr.pos[i*3],y=fr.pos[i*3+1],z=fr.pos[i*3+2]; v=Math.hypot(x,y,z); }
+    if(mode<=2){ if(fr.pos[i*3]===0&&fr.pos[i*3+1]===0&&fr.pos[i*3+2]===0) continue; }
+    else if(v===0) continue;
+    vals.push(v);
+  }
+  if(vals.length<32) return;
+  vals.sort((a,b)=>a-b);
+  const lo=vals[Math.floor(vals.length*0.02)], hi=vals[Math.floor(vals.length*0.98)];
+  const a=0.25;   // ちらつき防止のスムージング
+  levels.lo += (lo-levels.lo)*a;
+  levels.hi += (Math.max(hi,lo+1e-5)-levels.hi)*a;
+}
+
+// ---------- 再生 ----------
+const ui = {
+  mode:$("mode"), cmap:$("cmap"), autolvl:$("autolvl"), psize:$("psize"),
+  atten:$("atten"), rings:$("rings"), play:$("play"), seek:$("seek"),
+  speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
+  rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"),
+};
+let playing=false, playhead=0, curFrame=-1, curData=null, lastT=0, levelDirty=true;
+
+function fmtTime(s){
+  s=Math.max(0,s); const m=Math.floor(s/60), ss=Math.floor(s%60);
+  return `${String(m).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+}
+function setPlaying(p){
+  playing=p; ui.play.textContent = p ? "❚❚" : "▶";
+}
+ui.play.onclick = ()=>setPlaying(!playing);
+ui.seek.oninput = ()=>{ playhead = +ui.seek.value; };
+ui.mode.onchange = ()=>{ levelDirty=true; levels.lo=0; levels.hi=1; };
+$("resetcam").onclick = resetCam;
+document.addEventListener("keydown",e=>{
+  if(e.code==="Space"){ e.preventDefault(); setPlaying(!playing); }
+  else if(e.code==="ArrowRight"){ setPlaying(false); playhead=Math.min(INFO.n_frames-1, Math.floor(playhead)+(e.shiftKey?20:1)); }
+  else if(e.code==="ArrowLeft"){ setPlaying(false); playhead=Math.max(0, Math.floor(playhead)-(e.shiftKey?20:1)); }
+});
+
+// ---------- PLY 書き出し ----------
+$("ply").onclick = ()=>{
+  if(!curData) return;
+  const fr=curData; const idx=[];
+  for(let i=0;i<fr.n;i++)
+    if(fr.pos[i*3]!==0||fr.pos[i*3+1]!==0||fr.pos[i*3+2]!==0) idx.push(i);
+  const head = `ply\nformat binary_little_endian 1.0\nelement vertex ${idx.length}\n`+
+    `property float x\nproperty float y\nproperty float z\n`+
+    `property uchar reflectivity\nend_header\n`;
+  const hb=new TextEncoder().encode(head);
+  const body=new ArrayBuffer(idx.length*13); const dv=new DataView(body);
+  idx.forEach((i,k)=>{
+    dv.setFloat32(k*13,   fr.pos[i*3],  true);
+    dv.setFloat32(k*13+4, fr.pos[i*3+1],true);
+    dv.setFloat32(k*13+8, fr.pos[i*3+2],true);
+    dv.setUint8 (k*13+12, fr.refl[i]);
+  });
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([hb,body]));
+  a.download=`frame_${String(curFrame).padStart(5,"0")}.ply`;
+  a.click(); URL.revokeObjectURL(a.href);
+};
+
+// ---------- 3DGS標準PLY書き出し(SuperSplat等の3DGSツールで読める形式) ----------
+function cmapJS(c, t){
+  t = Math.min(1, Math.max(0, t));
+  const P = (cs)=>cs.reduceRight((acc,co)=>co.map((v,i)=>v+t*acc[i]),[0,0,0]);
+  const maps = [
+    [[-0.002136,-0.000750,-0.005386],[0.251661,0.677523,2.494027],[8.353717,-3.577720,0.314468],[-27.668733,14.264731,-13.649213],[52.176140,-27.943606,12.944169],[-50.768525,29.046583,4.234153],[18.655705,-11.489774,-5.601962]],
+    [[0.000219,0.001651,-0.019481],[0.106513,0.563956,3.932712],[11.602493,-3.972854,-15.942394],[-41.703996,17.436399,44.354145],[77.162936,-33.402359,-81.807309],[-71.319428,32.626064,73.209520],[25.131126,-12.242669,-23.070325]],
+    [[0.277727,0.005407,0.334100],[0.105093,1.404614,1.384590],[-0.330862,0.214848,0.095095],[-4.634230,-5.799101,-19.332441],[6.228270,14.179933,56.690553],[4.776385,-13.745145,-65.353033],[-5.435456,4.645853,26.312435]],
+  ];
+  if (c<=2) return P(maps[c]).map(v=>Math.min(1,Math.max(0,v)));
+  if (c===3){ // turbo
+    const t2=t*t, t3=t2*t, t4=t3*t, t5=t4*t;
+    return [
+      0.13572138+4.61539260*t-42.66032258*t2+132.13108234*t3-152.94239396*t4+59.28637943*t5,
+      0.09140261+2.19418839*t+4.84296658*t2-14.18503333*t3+4.27729857*t4+2.82956604*t5,
+      0.10667330+12.64194608*t-60.58204836*t2+110.36276771*t3-89.90310912*t4+27.34824973*t5,
+    ].map(v=>Math.min(1,Math.max(0,v)));
+  }
+  return [t,t,t];
+}
+function pointValue(fr, i, mode){
+  if (mode===0) return fr.refl[i]/255;
+  if (mode===1) return fr.sig[i]/65535;
+  if (mode===2) return fr.nir[i]/65535;
+  if (mode===3) return fr.pos[i*3+2];
+  return Math.hypot(fr.pos[i*3], fr.pos[i*3+1], fr.pos[i*3+2]);
+}
+$("gsply").onclick = ()=>{
+  if (!curData) return;
+  const fr=curData, mode=+ui.mode.value, cmapId=+ui.cmap.value;
+  const radMul=+ui.radmul.value, SH0=0.28209479177387814;
+  const idx=[];
+  for (let i=0;i<fr.n;i++)
+    if (fr.pos[i*3]!==0||fr.pos[i*3+1]!==0||fr.pos[i*3+2]!==0) idx.push(i);
+  const props=["x","y","z","nx","ny","nz","f_dc_0","f_dc_1","f_dc_2",
+               "opacity","scale_0","scale_1","scale_2","rot_0","rot_1","rot_2","rot_3"];
+  const head=`ply\nformat binary_little_endian 1.0\nelement vertex ${idx.length}\n`+
+    props.map(p=>`property float ${p}`).join("\n")+`\nend_header\n`;
+  const hb=new TextEncoder().encode(head);
+  const stride=props.length*4;
+  const body=new ArrayBuffer(idx.length*stride);
+  const dv=new DataView(body);
+  const opa=Math.log(0.85/0.15);   // inverse sigmoid
+  idx.forEach((i,k)=>{
+    let o=k*stride;
+    const x=fr.pos[i*3], y=fr.pos[i*3+1], z=fr.pos[i*3+2];
+    // 法線(octデコード)
+    let ex=fr.nrm[i*2]/127, ey=fr.nrm[i*2+1]/127;
+    let nz=1-Math.abs(ex)-Math.abs(ey), nx=ex, ny=ey;
+    if (nz<0){ const ax=nx, ay=ny;
+      nx=(1-Math.abs(ay))*(ax>=0?1:-1); ny=(1-Math.abs(ax))*(ay>=0?1:-1); }
+    const nl=Math.hypot(nx,ny,nz)||1; nx/=nl; ny/=nl; nz/=nl;
+    const t=(pointValue(fr,i,mode)-levels.lo)/Math.max(levels.hi-levels.lo,1e-6);
+    const rgb=cmapJS(cmapId,t);
+    const r=0.004*Math.pow(1.0182,fr.rad[i])*radMul, sg=r*0.6;
+    // z軸を法線に合わせるクォータニオン (w,x,y,z)
+    let qw=1+nz, qx=-ny, qy=nx, qz=0;
+    if (qw<1e-6){ qw=0; qx=1; qy=0; qz=0; }
+    const ql=Math.hypot(qw,qx,qy,qz);
+    const put=v=>{dv.setFloat32(o,v,true);o+=4;};
+    put(x);put(y);put(z); put(nx);put(ny);put(nz);
+    put((rgb[0]-0.5)/SH0); put((rgb[1]-0.5)/SH0); put((rgb[2]-0.5)/SH0);
+    put(opa);
+    put(Math.log(sg)); put(Math.log(sg)); put(Math.log(sg*0.15));
+    put(qw/ql); put(qx/ql); put(qy/ql); put(qz/ql);
+  });
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([hb,body]));
+  a.download=`frame_${String(curFrame).padStart(5,"0")}_3dgs.ply`;
+  a.click(); URL.revokeObjectURL(a.href);
+};
+
+// ---------- メインループ ----------
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  const w = Math.round(canvas.clientWidth*dpr), h = Math.round(canvas.clientHeight*dpr);
+  if(canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; }
+  return dpr;
+}
+
+let frameCounter=0;
+function loop(tms){
+  requestAnimationFrame(loop);
+  const dt = Math.min(lastT ? (tms-lastT)/1000 : 0, 0.1); lastT = tms;
+  if(!INFO) return;
+
+  if(playing){
+    const next = playhead + dt*INFO.fps*(+ui.speed.value);
+    const nf = Math.min(Math.floor(next), INFO.n_frames-1);
+    if (cache.has(nf) || nf===curFrame){
+      playhead = next;
+      if (playhead >= INFO.n_frames){ playhead = 0; }  // ループ再生
+      ui.buffering.style.display="none";
+    } else {
+      ui.buffering.style.display="block";   // 先読み待ち(時間を進めない)
+    }
+  }
+  const want = Math.min(Math.floor(playhead), INFO.n_frames-1);
+  prefetch(want);
+  ui.seek.value = want;
+
+  if (want !== curFrame && cache.has(want)){
+    curData = cache.get(want); curFrame = want;
+    upload(curData);
+    frameCounter++;
+    if (ui.autolvl.checked && (levelDirty || frameCounter%6===0)){
+      computeLevels(curData, +ui.mode.value); levelDirty=false;
+    }
+  } else if (want!==curFrame){
+    getFrame(want).catch(()=>{});
+  }
+
+  const dpr = resize();
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0.012,0.012,0.02,1);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+  const proj = perspective(55*Math.PI/180, canvas.width/canvas.height, 0.05, 300);
+  const {v:view} = viewMatrix();
+
+  if (ui.rings.checked){
+    gl.useProgram(lineProg);
+    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg,"uProj"),false,proj);
+    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg,"uView"),false,view);
+    gl.uniform4f(gl.getUniformLocation(lineProg,"uColor"),0.22,0.24,0.3,1);
+    gl.bindBuffer(gl.ARRAY_BUFFER,ringVBO);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.LINES,0,ringCount);
+  }
+
+  if (curData && vao){
+    const splat = ui.rmode.value === "1";
+    if (splat){
+      if (needResort(curFrame)) sortSplats(curData, view);
+      gl.useProgram(splatProg);
+      const u=n=>gl.getUniformLocation(splatProg,n);
+      gl.uniformMatrix4fv(u("uProj"),false,proj);
+      gl.uniformMatrix4fv(u("uView"),false,view);
+      gl.uniform1f(u("uRadMul"), +ui.radmul.value);
+      gl.uniform1f(u("uOpacity"), +ui.opac.value);
+      gl.uniform1f(u("uFocal"), proj[5]*canvas.height/2);
+      gl.uniform1f(u("uDpr"), dpr);
+      gl.uniform2f(u("uVp"), canvas.width, canvas.height);
+      gl.uniform2f(u("uPxy"), proj[0], proj[5]);
+      gl.uniform1i(u("uMode"), +ui.mode.value);
+      gl.uniform1i(u("uCmap"), +ui.cmap.value);
+      gl.uniform1f(u("uLo"), levels.lo);
+      gl.uniform1f(u("uHi"), levels.hi);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // 前乗算α, 奥→手前描画
+      gl.depthMask(false);
+      gl.bindVertexArray(vao);
+      gl.drawElements(gl.POINTS, N, gl.UNSIGNED_INT, 0);
+      gl.bindVertexArray(null);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    } else {
+      gl.useProgram(ptProg);
+      const u=n=>gl.getUniformLocation(ptProg,n);
+      gl.uniformMatrix4fv(u("uProj"),false,proj);
+      gl.uniformMatrix4fv(u("uView"),false,view);
+      gl.uniform1f(u("uPointSize"), +ui.psize.value);
+      gl.uniform1f(u("uAtten"), ui.atten.checked?1:0);
+      gl.uniform1f(u("uDpr"), dpr);
+      gl.uniform1i(u("uMode"), +ui.mode.value);
+      gl.uniform1i(u("uCmap"), +ui.cmap.value);
+      gl.uniform1f(u("uLo"), levels.lo);
+      gl.uniform1f(u("uHi"), levels.hi);
+      gl.bindVertexArray(vao);
+      gl.drawArrays(gl.POINTS,0,N);
+      gl.bindVertexArray(null);
+    }
+  }
+
+  const t = playhead/INFO.fps;
+  ui.time.textContent = `${fmtTime(t)} / ${fmtTime(INFO.duration_s)}  #${want}`;
+  ui.stats.textContent =
+    `フレーム ${want+1}/${INFO.n_frames} ・ 点数 ${INFO.n_points.toLocaleString()} ・ `+
+    `キャッシュ ${cache.size}`;
+}
+
+// ---------- 起動 ----------
+fetch("/info").then(r=>r.json()).then(info=>{
+  INFO=info;
+  $("ttl").textContent = `${info.sensor}  点群ビューア`;
+  $("sub").textContent = `${info.pcap} ・ ${info.mode} ・ ${info.n_frames}フレーム ・ `+
+                         `${info.fps.toFixed(1)}fps`;
+  ui.seek.max = info.n_frames-1;
+  initBuffers(info.n_points);
+  getFrame(0).then(()=>{ setPlaying(true); });
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
