@@ -46,9 +46,9 @@ opacity, auto-leveling, and range rings.
   oriented elliptical Gaussian whose normal is estimated from the range
   image neighborhood — giving a continuous, Gaussian-Splatting-like
   surface appearance. Splats are depth-sorted and alpha-blended.
-- **"PLY書き出し" (Export PLY)**: saves the current frame as a plain
+- **Export PLY**: saves the current frame as a plain
   binary PLY (readable by TouchDesigner's Point File In, etc.).
-- **"3DGS PLY書き出し" (Export 3DGS PLY)**: saves the current frame in the
+- **Export 3DGS PLY**: saves the current frame in the
   standard **3D Gaussian Splatting PLY format** (with f_dc / opacity /
   scale / rot), loadable directly in SuperSplat
   (https://playcanvas.com/supersplat/editor) and other gsplat viewers.

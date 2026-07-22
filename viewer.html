@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>LiDAR 点群ビューア — OS-DOME-128</title>
+<title>LiDAR Point Cloud Viewer — OS-DOME-128</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#ddd;
     font:13px/1.5 "Hiragino Sans","Noto Sans JP",sans-serif;}
@@ -39,48 +39,48 @@
 <canvas id="cv"></canvas>
 
 <div id="panel">
-  <h1 id="ttl">LiDAR 点群ビューア</h1>
-  <div class="sub" id="sub">読み込み中…</div>
-  <div class="row"><label>描画</label>
+  <h1 id="ttl">LiDAR Point Cloud Viewer</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <div class="row"><label>Render</label>
     <select id="rmode">
-      <option value="1" selected>スプラット</option>
-      <option value="0">点</option>
+      <option value="1" selected>Splats</option>
+      <option value="0">Points</option>
     </select></div>
-  <div class="row"><label>カラー</label>
+  <div class="row"><label>Color</label>
     <select id="mode">
-      <option value="0" selected>反射率</option>
-      <option value="1">信号強度</option>
-      <option value="2">近赤外</option>
-      <option value="3">高さ (Z)</option>
-      <option value="4">距離</option>
+      <option value="0" selected>Reflectivity</option>
+      <option value="1">Signal</option>
+      <option value="2">Near-IR</option>
+      <option value="3">Height (Z)</option>
+      <option value="4">Range</option>
     </select></div>
-  <div class="row"><label>カラーマップ</label>
+  <div class="row"><label>Colormap</label>
     <select id="cmap">
       <option value="0" selected>Magma</option>
       <option value="1">Inferno</option>
       <option value="2">Viridis</option>
       <option value="3">Turbo</option>
-      <option value="4">グレー</option>
+      <option value="4">Gray</option>
     </select></div>
-  <div class="row"><label>自動レベル</label><input type="checkbox" id="autolvl" checked></div>
-  <div class="row"><label>点サイズ</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
-  <div class="row"><label>スプラット径</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.1" value="1.2"></div>
-  <div class="row"><label>不透明度</label><input type="range" id="opac" min="0.3" max="1" step="0.05" value="1"></div>
-  <div class="row"><label>距離減衰</label><input type="checkbox" id="atten" checked></div>
-  <div class="row"><label>距離リング</label><input type="checkbox" id="rings" checked></div>
+  <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
+  <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
+  <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.1" value="1.2"></div>
+  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.3" max="1" step="0.05" value="1"></div>
+  <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
+  <div class="row"><label>Range rings</label><input type="checkbox" id="rings" checked></div>
   <div class="row">
-    <button id="resetcam">視点リセット</button>
-    <button id="ply">PLY書き出し</button>
+    <button id="resetcam">Reset view</button>
+    <button id="ply">Export PLY</button>
   </div>
   <div class="row">
-    <button id="gsply" style="width:100%">3DGS PLY書き出し (現フレーム)</button>
+    <button id="gsply" style="width:100%">Export 3DGS PLY (current frame)</button>
   </div>
   <div id="stats">–</div>
 </div>
 
-<div id="buffering">● バッファ中…</div>
-<div id="help">ドラッグ: 回転 / 右ドラッグ・Shift: 移動 / ホイール: ズーム<br>
-Space: 再生 / ←→: コマ送り (Shiftで±20)</div>
+<div id="buffering">● Buffering…</div>
+<div id="help">Drag: orbit / Right-drag·Shift: pan / Wheel: zoom<br>
+Space: play / ←→: step frames (±20 with Shift)</div>
 
 <div id="bar">
   <button id="play">▶</button>
@@ -679,15 +679,15 @@ function loop(tms){
   const t = playhead/INFO.fps;
   ui.time.textContent = `${fmtTime(t)} / ${fmtTime(INFO.duration_s)}  #${want}`;
   ui.stats.textContent =
-    `フレーム ${want+1}/${INFO.n_frames} ・ 点数 ${INFO.n_points.toLocaleString()} ・ `+
-    `キャッシュ ${cache.size}`;
+    `Frame ${want+1}/${INFO.n_frames} · ${INFO.n_points.toLocaleString()} pts · `+
+    `cached ${cache.size}`;
 }
 
 // ---------- 起動 ----------
 fetch("/info").then(r=>r.json()).then(info=>{
   INFO=info;
-  $("ttl").textContent = `${info.sensor}  点群ビューア`;
-  $("sub").textContent = `${info.pcap} ・ ${info.mode} ・ ${info.n_frames}フレーム ・ `+
+  $("ttl").textContent = `${info.sensor} Point Cloud Viewer`;
+  $("sub").textContent = `${info.pcap} · ${info.mode} · ${info.n_frames} frames · `+
                          `${info.fps.toFixed(1)}fps`;
   ui.seek.max = info.n_frames-1;
   initBuffers(info.n_points);

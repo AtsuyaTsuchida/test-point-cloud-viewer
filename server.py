@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ouster OS-DOME-128 pcap → 動的3D点群ビューアサーバ
+Ouster OS-DOME-128 pcap → dynamic 3D point cloud viewer server
 
-pcap(録画データ)とセンサJSONメタデータを読み込み、フレーム単位で
-XYZ点群にデコードしてブラウザのWebGLビューア(viewer.html)へ配信する。
+Reads a pcap recording and its sensor metadata JSON, decodes frames into
+XYZ point clouds on demand, and serves them to the WebGL viewer
+(viewer.html) in the browser.
 
-初回起動時にpcap全体をスキャンしてフレーム索引を作り、
-"<pcap>.viewidx.npz" にキャッシュする(2回目以降は即起動)。
+On first launch the whole pcap is scanned to build a frame index, cached
+as "<pcap>.viewidx.npz" (subsequent launches start instantly).
 
-使い方:
+Usage:
     python3 server.py [--pcap PATH] [--meta PATH] [--port 8765] [--no-open]
 """
 import argparse
@@ -51,7 +52,7 @@ class OusterPcap:
         fmt = self.meta["lidar_data_format"]
         prof = fmt["udp_profile_lidar"]
         if prof != "RNG19_RFL8_SIG16_NIR16":
-            raise SystemExit(f"未対応のUDPプロファイルです: {prof}")
+            raise SystemExit(f"Unsupported UDP profile: {prof}")
         self.H = fmt["pixels_per_column"]        # 128
         self.W = fmt["columns_per_frame"]        # 1024
         self.cols_per_packet = fmt["columns_per_packet"]  # 16
@@ -110,13 +111,13 @@ class OusterPcap:
                     self.frame_start = z["frame_start"]
                     self.frame_count = z["frame_count"]
                     self.frame_ts = z["frame_ts"]
-                    print(f"索引キャッシュ読込: {len(self.frame_start)} フレーム")
+                    print(f"Index cache loaded: {len(self.frame_start)} frames")
                     return
-                print("索引キャッシュが古いので再構築します")
+                print("Index cache is stale, rebuilding")
             except Exception as e:
-                print("索引キャッシュ読込失敗:", e)
+                print("Failed to load index cache:", e)
 
-        print("pcapを索引化しています(初回のみ、数十秒かかります)...")
+        print("Indexing pcap (first run only, may take a while)...")
         mm, N = self.mm, len(self.mm)
         expect_caplen = self.payload_size + ETH_IP_UDP
         unpack = struct.unpack_from
@@ -134,14 +135,14 @@ class OusterPcap:
                 offs.append(p)
                 tss.append(ts + tus * 1e-6)
                 if len(offs) % 100000 == 0:
-                    print(f"  {len(offs)} パケット / {pos/N*100:.0f}%")
+                    print(f"  {len(offs)} packets / {pos/N*100:.0f}%")
             pos = data_pos + caplen
 
         fids = np.asarray(fids, np.int64)
         offs = np.asarray(offs, np.int64)
         tss = np.asarray(tss, np.float64)
         if len(fids) == 0:
-            raise SystemExit("LiDARパケットが見つかりませんでした")
+            raise SystemExit("No LiDAR packets found")
 
         change = np.nonzero(np.diff(fids) != 0)[0] + 1
         starts = np.concatenate([[0], change])
@@ -153,14 +154,14 @@ class OusterPcap:
         self.frame_start = starts
         self.frame_count = counts
         self.frame_ts = tss[starts]
-        print(f"索引化完了: {len(starts)} フレーム, {len(offs)} パケット "
+        print(f"Indexing done: {len(starts)} frames, {len(offs)} packets "
               f"({time.time()-t0:.1f}s)")
         try:
             np.savez(cache, key=key, pkt_off=offs, frame_start=starts,
                      frame_count=counts, frame_ts=self.frame_ts)
-            print("索引キャッシュ保存:", cache)
+            print("Index cache saved:", cache)
         except OSError as e:
-            print("索引キャッシュ保存失敗(次回また索引化されます):", e)
+            print("Failed to save index cache (will re-index next time):", e)
 
     @property
     def n_frames(self):
@@ -323,32 +324,32 @@ def make_handler(src: OusterPcap):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Ouster pcap 3D点群ビューア")
+    ap = argparse.ArgumentParser(description="Ouster pcap 3D point cloud viewer")
     ap.add_argument("--pcap", default=DEFAULT_PCAP)
     ap.add_argument("--meta", default=DEFAULT_META)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true",
-                    help="ブラウザを自動で開かない")
+                    help="do not open the browser automatically")
     args = ap.parse_args()
 
-    for p, label in [(args.pcap, "pcap"), (args.meta, "メタデータJSON")]:
+    for p, label in [(args.pcap, "pcap"), (args.meta, "metadata JSON")]:
         if not os.path.exists(p):
-            raise SystemExit(f"{label} が見つかりません: {p}")
+            raise SystemExit(f"{label} not found: {p}")
 
     src = OusterPcap(args.pcap, args.meta)
     print(f"{src.meta['sensor_info']['prod_line']}  "
-          f"{src.n_frames} フレーム  {src.fps:.1f} fps  "
-          f"{src.frame_ts[-1]-src.frame_ts[0]:.1f} 秒")
+          f"{src.n_frames} frames  {src.fps:.1f} fps  "
+          f"{src.frame_ts[-1]-src.frame_ts[0]:.1f} s")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(src))
     url = f"http://127.0.0.1:{args.port}/"
-    print("ビューア:", url, " (Ctrl+Cで終了)")
+    print("Viewer:", url, " (Ctrl+C to quit)")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n終了します")
+        print("\nShutting down")
 
 
 if __name__ == "__main__":
