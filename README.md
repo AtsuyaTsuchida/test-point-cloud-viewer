@@ -1,64 +1,73 @@
-# LiDAR 点群ビューア (Ouster OS-DOME-128)
+# LiDAR Point Cloud Viewer (Ouster OS-DOME-128)
 
-Ousterのpcap録画 + センサJSONメタデータを、ブラウザ上で動的3D点群として
-再生・操作できるビューアです。依存は **Python 3 + numpy** のみ
-(ビューア側はライブラリなしのWebGL2)。
+A browser-based viewer that plays back an Ouster pcap recording (plus its
+sensor metadata JSON) as a dynamic 3D point cloud. The only dependency is
+**Python 3 + numpy** — the viewer itself is plain WebGL2 with no libraries.
 
-## 起動
+## Getting started
 
 ```sh
 ./run.sh
-# または
+# or
 python3 server.py
 ```
 
-ブラウザが自動で開きます (http://127.0.0.1:8765/)。
-デフォルトで `DATA/20260701_可視化本映像３次元データ（動画）/` のpcapを読みます。
-別ファイルは `--pcap` / `--meta` で指定:
+Your browser opens automatically at http://127.0.0.1:8765/.
+By default the server reads the pcap under
+`DATA/20260701_可視化本映像３次元データ（動画）/`.
+To use different files, pass `--pcap` / `--meta`:
 
 ```sh
 python3 server.py --pcap /path/to/rec.pcap --meta /path/to/meta.json
 ```
 
-- 初回のみpcap全体を索引化します(11GBで数分)。結果は
-  `<pcap>.viewidx.npz` にキャッシュされ、2回目以降は即起動します。
-- フレームは再生位置に合わせてオンデマンドにデコード・先読みされるので、
-  11GBでもメモリを圧迫しません。
+- On first launch the whole pcap is indexed (a few minutes for 11 GB).
+  The index is cached as `<pcap>.viewidx.npz`, so subsequent launches
+  start instantly.
+- Frames are decoded on demand and prefetched around the playhead, so
+  even an 11 GB capture uses little memory.
 
-## 操作
+## Controls
 
-| 操作 | 内容 |
+| Input | Action |
 |---|---|
-| ドラッグ | 回転 |
-| 右ドラッグ / Shift+ドラッグ | 平行移動 |
-| ホイール | ズーム |
-| Space | 再生 / 一時停止 |
-| ← → | コマ送り (Shiftで±20フレーム) |
+| Drag | Orbit |
+| Right-drag / Shift+drag | Pan |
+| Wheel | Zoom |
+| Space | Play / pause |
+| ← → | Step one frame (±20 with Shift) |
 
-パネルから 描画(スプラット/点)、カラー(反射率/信号強度/近赤外/高さ/距離)、
-カラーマップ(Magma/Inferno/Viridis/Turbo/グレー)、点サイズ/スプラット径/不透明度、
-自動レベル補正、距離リングを切り替えられます。
+The panel lets you switch rendering (splat / points), color source
+(reflectivity / signal / near-IR / height / range), colormap
+(Magma / Inferno / Viridis / Turbo / gray), point size / splat radius /
+opacity, auto-leveling, and range rings.
 
-- **スプラット描画(デフォルト)**: 各点を距離画像の隣接関係から推定した
-  法線付きサーフェル(楕円ガウシアン)として描画。Gaussian Splatting風の
-  連続した面の見た目になります。深度ソート+αブレンドで正しく合成。
-- 「PLY書き出し」: 表示中フレームを素のバイナリPLYで保存
-  (TouchDesignerのPoint File In等で読めます)。
-- 「3DGS PLY書き出し」: 表示中フレームを**3D Gaussian Splatting標準の
-  PLY形式**(f_dc/opacity/scale/rot付き)で保存。SuperSplat
-  (https://playcanvas.com/supersplat/editor)やgsplat系ビューアに
-  そのまま読み込めます。色は現在のカラー設定が焼き込まれます。
+- **Splat rendering (default)**: each point is drawn as a surfel — an
+  oriented elliptical Gaussian whose normal is estimated from the range
+  image neighborhood — giving a continuous, Gaussian-Splatting-like
+  surface appearance. Splats are depth-sorted and alpha-blended.
+- **"PLY書き出し" (Export PLY)**: saves the current frame as a plain
+  binary PLY (readable by TouchDesigner's Point File In, etc.).
+- **"3DGS PLY書き出し" (Export 3DGS PLY)**: saves the current frame in the
+  standard **3D Gaussian Splatting PLY format** (with f_dc / opacity /
+  scale / rot), loadable directly in SuperSplat
+  (https://playcanvas.com/supersplat/editor) and other gsplat viewers.
+  The current color settings are baked in.
 
-## 実装メモ
+## Implementation notes
 
-- `server.py` — pcapをmmapし、UDPペイロード(eUDP `RNG19_RFL8_SIG16_NIR16`,
-  32Bヘッダ + 16列×(12B + 128px×12B) + 32Bフッタ)をnumpyでデコード。
-  XYZ変換は ouster-sdk の `make_xyz_lut` と同じ式
-  (beam_intrinsics + lidar_to_sensor_transform) を事前計算LUT化。
-  さらに距離画像の隣接点からサーフェル法線(oct圧縮int8×2)と
-  半径(対数u8)を推定して配信。1フレーム(131,072点)約40ms。
-- `viewer.html` — WebGL2。位置float32 + 反射率u8/信号u16/近赤外u16/法線/半径を
-  頂点属性として保持し、カラーマップはシェーダ内多項式近似で計算。
-  スプラットは接平面とレイの交点で楕円フットプリントを算出し、
-  CPU基数ソート(奥→手前)+前乗算αブレンドで合成。
-  フレームはLRUキャッシュ(約280フレーム)+先読み4並列。
+- `server.py` — mmaps the pcap and decodes the UDP payloads
+  (eUDP `RNG19_RFL8_SIG16_NIR16`: 32 B header + 16 columns ×
+  (12 B + 128 px × 12 B) + 32 B footer) with numpy.
+  The XYZ conversion uses the same formula as ouster-sdk's
+  `make_xyz_lut` (beam_intrinsics + lidar_to_sensor_transform),
+  precomputed as a lookup table. It also estimates per-point surfel
+  normals (oct-encoded int8×2) and radii (log-encoded u8) from the
+  range-image neighborhood. One frame (131,072 points) takes ~40 ms.
+- `viewer.html` — WebGL2. Positions are float32; reflectivity u8,
+  signal u16, near-IR u16, normal, and radius are vertex attributes.
+  Colormaps are polynomial approximations evaluated in the shader.
+  Splat footprints are computed by intersecting the view ray with each
+  surfel's tangent plane, composited with a CPU radix sort
+  (back-to-front) and premultiplied alpha blending.
+  Frames go through an LRU cache (~280 frames) with 4 parallel prefetches.
