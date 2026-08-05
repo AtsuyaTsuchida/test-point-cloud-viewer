@@ -76,10 +76,10 @@
       <option value="9">9 frames</option>
     </select></div>
   <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
-  <div class="row"><label>Range rings</label><input type="checkbox" id="rings" checked></div>
+  <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
   <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
-  <div class="row"><label>Dynamic only</label><input type="range" id="dynmin" min="0" max="100" step="5" value="0"></div>
+  <div class="row"><label>Dynamic only</label><input type="range" id="dynmin" min="0" max="100" step="5" value="30"></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -364,8 +364,10 @@ function lookAt(eye, tgt, up){
 }
 
 // ---------- カメラ ----------
-const cam = { yaw:-1.0, pitch:0.35, dist:9, tgt:[0,0,1.6] };
-function resetCam(){ cam.yaw=-1.0; cam.pitch=0.35; cam.dist=9; cam.tgt=[0,0,1.6]; }
+// 会場メッシュの内側に収まる視点。既定値のままだとホール隅の壁にめり込む。
+const CAM0 = { yaw:3.0, pitch:0.35, dist:8, tgt:[-1.0,0,1.2] };
+const cam = { ...CAM0, tgt:[...CAM0.tgt] };
+function resetCam(){ cam.yaw=CAM0.yaw; cam.pitch=CAM0.pitch; cam.dist=CAM0.dist; cam.tgt=[...CAM0.tgt]; }
 function viewMatrix(){
   const cp=Math.cos(cam.pitch), sp=Math.sin(cam.pitch);
   const eye=[cam.tgt[0]+cam.dist*cp*Math.cos(cam.yaw),
