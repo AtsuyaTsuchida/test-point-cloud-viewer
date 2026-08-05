@@ -74,6 +74,7 @@ class OusterPcap:
         f = open(pcap_path, "rb")
         self.mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
+        self._bg = None                # 時間中央値の背景レンジ画像
         self._raw = {}                 # frame idx -> (rng, refl, sig, nir)
         self._raw_order = []
         self._raw_lock = threading.Lock()
@@ -262,7 +263,7 @@ class OusterPcap:
         return med.astype(np.uint32)
 
     # --- 1フレームをデコードして点群バイナリを返す ---
-    def decode(self, i, tm=1):
+    def decode(self, i, tm=1, seed_cm=0, grow_m=0.0):
         rng, refl, sig, nir = self._decode_raw(i)
         if tm > 1:
             rng = self._median_range(i, tm)
@@ -275,7 +276,15 @@ class OusterPcap:
         pts = np.ascontiguousarray(np.moveaxis(xyz, 0, -1).reshape(-1, 3),
                                    np.float32)
         quads = self._quads(rng)
-        dyn = venue_distance_cm(pts.astype(np.float64))
+        # 背景より手前に何cm出ているか。背景が無い画素は新規出現として255。
+        bg = self.background()
+        rf = rng.astype(np.float32)
+        fg = np.where((rng > 0) & (bg > 0), (bg - rf) / 10.0,
+                      np.where(rng > 0, 255.0, 0.0))
+        dyn = np.clip(fg, 0.0, 255.0).astype(np.uint8)
+        if seed_cm > 0 and grow_m > 0.0:
+            grown = self._grow_dynamic(xyz, rng, dyn, seed_cm, grow_m)
+            dyn = np.where(grown, 255, 0).astype(np.uint8)
         t_rel = float(self.frame_ts[i] - self.frame_ts[0])
         header = struct.pack("<4sIff", b"OPC5", pts.shape[0], t_rel, self.fps)
         return b"".join([header, pts.tobytes(),
@@ -285,6 +294,69 @@ class OusterPcap:
                          normal.tobytes(), rad_maj.tobytes(),
                          rad_min.tobytes(), phi.tobytes(), dyn.tobytes(),
                          struct.pack("<I", quads.shape[0]), quads.tobytes()])
+
+    # --- 背景モデル: 収録全体に散らした数十枚の画素ごと中央値 ---
+    # 会場スキャンとの距離で動体を判定すると位置合わせ誤差に支配される
+    # (静止フレームでも12.3%が30cm以上ずれ、S/N比が0.97しか出なかった)。
+    # 同じセンサーの中央値なら画素単位で厳密に一致する。
+    def background(self, k=31):
+        if self._bg is None:
+            idx = np.linspace(0, self.n_frames - 1, k).astype(int)
+            st = np.stack([self._decode_raw(int(i))[0]
+                           for i in idx]).astype(np.float32)
+            st[st == 0] = np.nan
+            with np.errstate(invalid="ignore"):
+                med = np.nanmedian(st, axis=0)
+            med[np.isnan(med)] = 0.0
+            self._bg = med
+        return self._bg
+
+    # --- 動体の種から面を辿って連結成分を広げる ---
+    # 会場からの距離だけで切ると、立っている人の足は必ず床の近くにあるので
+    # 消える。確実な動体(種)からレンジ画像の隣接を辿り、測地距離が予算内なら
+    # 会場からの距離に関わらず取り込む。床は斜入射で1ステップが0.8m級になり
+    # 予算をすぐ超えるため、そのまま漏れ出しの歯止めになる。
+    def _grow_dynamic(self, xyz, rng, dyn_cm, seed_cm, budget, iters=16):
+        H, W = self.H, self.W
+        V = rng > 0
+        rf = rng.astype(np.float32)
+        INF = np.float32(1e9)
+
+        # 方位方向の辺 (w -> w+1, 360°で巡回)
+        rn = np.roll(rf, -1, axis=1)
+        lu = np.linalg.norm(np.roll(xyz, -1, axis=2) - xyz, axis=0).astype(np.float32)
+        oku = V & np.roll(V, -1, axis=1)
+        oku &= np.abs(rn - rf) <= (MESH_TAN * self.step_u * 0.5 + REL_NOISE) \
+            * np.maximum(np.minimum(rf, rn), 1.0)
+
+        # ビーム方向の辺 (h -> h+1)
+        lv = np.zeros((H, W), np.float32)
+        okv = np.zeros((H, W), bool)
+        lv[:-1] = np.linalg.norm(xyz[:, 1:] - xyz[:, :-1], axis=0)
+        thr_v = (MESH_TAN * self.step_v[:-1] * 0.5 + REL_NOISE)[:, None]
+        okv[:-1] = (V[:-1] & V[1:]) & (np.abs(rf[1:] - rf[:-1])
+                                       <= thr_v * np.maximum(
+                                           np.minimum(rf[:-1], rf[1:]), 1.0))
+
+        cost = np.where(V & (dyn_cm.reshape(H, W) >= seed_cm), 0.0, INF)
+        cost = cost.astype(np.float32)
+        okv_up = np.zeros_like(okv)
+        okv_up[1:] = okv[:-1]
+        for _ in range(iters):
+            prev = cost
+            c = np.roll(cost, -1, axis=1) + lu          # w+1 から w へ
+            cost = np.where(oku & (c < cost), c, cost)
+            c = np.roll(cost + lu, 1, axis=1)           # w から w+1 へ
+            cost = np.where(np.roll(oku, 1, axis=1) & (c < cost), c, cost)
+            c = np.full_like(cost, INF)
+            c[:-1] = cost[1:] + lv[:-1]                 # h+1 から h へ
+            cost = np.where(okv & (c < cost), c, cost)
+            c = np.full_like(cost, INF)
+            c[1:] = cost[:-1] + lv[:-1]                 # h から h+1 へ
+            cost = np.where(okv_up & (c < cost), c, cost)
+            if np.array_equal(cost, prev):
+                break
+        return ((cost <= budget) & V).reshape(-1)
 
     # --- レンジ画像の格子から、面として繋いでよい四角形パッチを列挙する ---
     # グリッド接続性を使うとビーム間の隙間がテクスチャ補間で埋まり、独立した
@@ -521,11 +593,14 @@ def make_handler(src: OusterPcap):
                 elif self.path.startswith("/frame/"):
                     u = urlparse(self.path)
                     i = int(u.path.split("/")[2])
-                    tm = int(parse_qs(u.query).get("tm", ["1"])[0])
+                    q = parse_qs(u.query)
+                    tm = int(q.get("tm", ["1"])[0])
                     tm = max(1, min(15, tm | 1))    # 中央値を取るため奇数に丸める
+                    seed = max(0, min(200, int(q.get("seed", ["0"])[0])))
+                    grow = max(0.0, min(3.0, float(q.get("grow", ["0"])[0])))
                     if 0 <= i < src.n_frames:
                         self._send(200, "application/octet-stream",
-                                   src.decode(i, tm), cache=True)
+                                   src.decode(i, tm, seed, grow), cache=True)
                     else:
                         self._send(404, "text/plain", b"frame out of range")
                 else:

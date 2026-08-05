@@ -79,7 +79,8 @@
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
   <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
-  <div class="row"><label>Dynamic only</label><input type="range" id="dynmin" min="0" max="100" step="10" value="20"></div>
+  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="10"></div>
+  <div class="row"><label>Cluster grow</label><input type="checkbox" id="grow" checked></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -557,6 +558,7 @@ const MAX_CACHE = 280;            // ≈ 600MB
 const inflight = new Map();       // idx -> Promise
 let INFO=null;
 let TMED=1;                       // 時間中央値フィルタの枚数 (1=off)
+let SEED=10, GROW=0.6;            // 背景差の種(cm)と連結成長の測地距離予算(m)
 
 function parseFrame(buf){
   const dv = new DataView(buf);
@@ -582,7 +584,7 @@ function getFrame(i){
     return Promise.resolve(cache.get(i));
   }
   if (inflight.has(i)) return inflight.get(i);
-  const p = fetch("/frame/"+i+"?tm="+TMED).then(r=>{
+  const p = fetch("/frame/"+i+"?tm="+TMED+(GROW>0?"&seed="+SEED+"&grow="+GROW:"")).then(r=>{
     if(!r.ok) throw new Error("frame "+i);
     return r.arrayBuffer();
   }).then(buf=>{
@@ -638,6 +640,7 @@ const ui = {
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
+  grow:$("grow"),
 };
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
@@ -677,11 +680,13 @@ function setPlaying(p){
 ui.play.onclick = ()=>setPlaying(!playing);
 ui.seek.oninput = ()=>{ playhead = +ui.seek.value; };
 ui.mode.onchange = ()=>{ levelDirty=true; levels.lo=0; levels.hi=1; };
-ui.tmed.onchange = ()=>{   // フィルタ枚数が変わると全フレームの内容が変わる
-  TMED = +ui.tmed.value;
+function invalidate(){     // 前景抽出の条件が変わると全フレームの内容が変わる
   cache.clear(); order.length=0; inflight.clear();
-  curFrame=-1; curData=null;
-};
+  curFrame=-1; curData=null; meshFrame=-1;
+}
+ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
+ui.dynmin.onchange = ()=>{ SEED = +ui.dynmin.value; if(GROW>0) invalidate(); };
+ui.grow.onchange = ()=>{ GROW = ui.grow.checked ? 0.6 : 0; invalidate(); };
 $("resetcam").onclick = resetCam;
 document.addEventListener("keydown",e=>{
   if(e.code==="Space"){ e.preventDefault(); setPlaying(!playing); }
@@ -885,7 +890,7 @@ function loop(tms){
       gl.uniform1i(u("uW"), INFO.cols); gl.uniform1i(u("uH"), INFO.rows);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
-      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
         view[0]*LW[0]+view[4]*LW[1]+view[8]*LW[2],
@@ -906,7 +911,7 @@ function loop(tms){
       gl.uniform1f(u("uRadMul"), +ui.radmul.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
-      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
       // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
@@ -937,7 +942,7 @@ function loop(tms){
       gl.uniformMatrix4fv(u("uView"),false,view);
       gl.uniform1f(u("uPointSize"), +ui.psize.value);
       gl.uniform1f(u("uAtten"), ui.atten.checked?1:0);
-      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
       gl.uniform1f(u("uDpr"), dpr);
       gl.uniform1i(u("uMode"), +ui.mode.value);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
