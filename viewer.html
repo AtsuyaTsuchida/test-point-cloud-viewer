@@ -80,7 +80,7 @@
   <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
   <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="10"></div>
-  <div class="row"><label>Cluster grow</label><input type="checkbox" id="grow" checked></div>
+  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.2"></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -454,16 +454,21 @@ function initBuffers(n){
 
 // --- メッシュのインデックス構築 & テクスチャ更新 ---
 let meshIdx=null, meshCount=0, meshFrame=-1, texBuf=null;
+function meshDynThr(){ return GROW > 0 ? 1 : +ui.dynmin.value; }
 function buildMeshIdx(fr){
   const W = INFO.cols, q = fr.quads, m = q.length;
+  const dy = fr.dyn, thr = meshDynThr();
   if (!meshIdx || meshIdx.length < m*6) meshIdx = new Uint32Array(m*6);
   let o=0;
   for (let k=0;k<m;k++){
     const i00=q[k], i10=i00+W;
+    // 四隅とも前景のパッチだけ張る。会場は静止スキャン側が描くので、
+    // ここで面にすべきは被写体だけ。
+    if (thr>0 && (dy[i00]<thr || dy[i00+1]<thr || dy[i10]<thr || dy[i10+1]<thr)) continue;
     meshIdx[o++]=i00; meshIdx[o++]=i10;   meshIdx[o++]=i00+1;
     meshIdx[o++]=i00+1; meshIdx[o++]=i10; meshIdx[o++]=i10+1;
   }
-  meshCount = m*6;
+  meshCount = o;                 // 実際に書き出した数 (m*6 だと前景フィルタ後に古い分まで描く)
   gl.bindVertexArray(meshVao);
   gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, meshIdx, 0, meshCount);
   gl.bindVertexArray(null);
@@ -558,7 +563,7 @@ const MAX_CACHE = 280;            // ≈ 600MB
 const inflight = new Map();       // idx -> Promise
 let INFO=null;
 let TMED=1;                       // 時間中央値フィルタの枚数 (1=off)
-let SEED=10, GROW=0.6;            // 背景差の種(cm)と連結成長の測地距離予算(m)
+let SEED=10, GROW=1.2;            // 背景差の種(cm)と連結成長の測地距離予算(m)
 
 function parseFrame(buf){
   const dv = new DataView(buf);
@@ -640,7 +645,7 @@ const ui = {
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
-  grow:$("grow"),
+  growm:$("growm"),
 };
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
@@ -685,8 +690,8 @@ function invalidate(){     // 前景抽出の条件が変わると全フレー�
   curFrame=-1; curData=null; meshFrame=-1;
 }
 ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
-ui.dynmin.onchange = ()=>{ SEED = +ui.dynmin.value; if(GROW>0) invalidate(); };
-ui.grow.onchange = ()=>{ GROW = ui.grow.checked ? 0.6 : 0; invalidate(); };
+ui.dynmin.onchange = ()=>{ SEED = +ui.dynmin.value; meshFrame=-1; if(GROW>0) invalidate(); };
+ui.growm.onchange = ()=>{ GROW = +ui.growm.value; meshFrame=-1; invalidate(); };
 $("resetcam").onclick = resetCam;
 document.addEventListener("keydown",e=>{
   if(e.code==="Space"){ e.preventDefault(); setPlaying(!playing); }
@@ -890,7 +895,7 @@ function loop(tms){
       gl.uniform1i(u("uW"), INFO.cols); gl.uniform1i(u("uH"), INFO.rows);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
-      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
         view[0]*LW[0]+view[4]*LW[1]+view[8]*LW[2],
@@ -911,7 +916,7 @@ function loop(tms){
       gl.uniform1f(u("uRadMul"), +ui.radmul.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
-      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
       // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
@@ -942,7 +947,7 @@ function loop(tms){
       gl.uniformMatrix4fv(u("uView"),false,view);
       gl.uniform1f(u("uPointSize"), +ui.psize.value);
       gl.uniform1f(u("uAtten"), ui.atten.checked?1:0);
-      gl.uniform1f(u("uDynMin"), ui.grow.checked ? 1.0 : +ui.dynmin.value);
+      gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
       gl.uniform1f(u("uDpr"), dpr);
       gl.uniform1i(u("uMode"), +ui.mode.value);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
