@@ -275,14 +275,15 @@ class OusterPcap:
         pts = np.ascontiguousarray(np.moveaxis(xyz, 0, -1).reshape(-1, 3),
                                    np.float32)
         quads = self._quads(rng)
+        dyn = venue_distance_cm(pts.astype(np.float64))
         t_rel = float(self.frame_ts[i] - self.frame_ts[0])
-        header = struct.pack("<4sIff", b"OPC4", pts.shape[0], t_rel, self.fps)
+        header = struct.pack("<4sIff", b"OPC5", pts.shape[0], t_rel, self.fps)
         return b"".join([header, pts.tobytes(),
                          refl.reshape(-1).tobytes(),
                          sig.reshape(-1).astype("<u2").tobytes(),
                          nir.reshape(-1).astype("<u2").tobytes(),
                          normal.tobytes(), rad_maj.tobytes(),
-                         rad_min.tobytes(), phi.tobytes(),
+                         rad_min.tobytes(), phi.tobytes(), dyn.tobytes(),
                          struct.pack("<I", quads.shape[0]), quads.tobytes()])
 
     # --- レンジ画像の格子から、面として繋いでよい四角形パッチを列挙する ---
@@ -432,12 +433,37 @@ class OusterPcap:
                 ph8.astype(np.uint8).reshape(-1))
 
 
+VENUE_DIST = None        # (dist grid, origin, cell) — 会場表面からの距離(ボクセル単位)
+
+
+def venue_distance_cm(pts):
+    """各点の会場表面からの距離をcmで返す。会場が無ければ全点255(=動体扱い)。"""
+    if VENUE_DIST is None:
+        return np.full(len(pts), 255, np.uint8)
+    dist, origin, cell = VENUE_DIST
+    dims = np.array(dist.shape)
+    k = ((pts - origin) / cell).astype(np.int64)
+    ok = np.all((k >= 0) & (k < dims), axis=1)
+    out = np.full(len(pts), 255, np.int32)
+    kk = k[ok]
+    v = dist[kk[:, 0], kk[:, 1], kk[:, 2]].astype(np.int32)
+    out[ok] = np.where(v == 255, 255,
+                       np.minimum(v * int(round(cell * 100)), 254))
+    return out.astype(np.uint8)
+
+
 def load_venue():
     """bake_venue.py が焼いた会場メッシュ (LiDAR座標系, 頂点カラー付き)。"""
+    global VENUE_DIST
     p = os.path.join(HERE, "venue.npz")
     if not os.path.exists(p):
         return None
     z = np.load(p)
+    if "dist" in z:
+        VENUE_DIST = (z["dist"], z["dist_origin"].astype(np.float64),
+                      float(z["dist_cell"]))
+        print(f"Venue distance grid: {z['dist'].shape} @"
+              f"{float(z['dist_cell'])*100:.0f}cm")
     v = z["verts"].astype(np.float32)
     c = np.clip(z["colors"] * 255.0, 0, 255).astype(np.uint8)
     f = z["faces"].astype(np.uint32)

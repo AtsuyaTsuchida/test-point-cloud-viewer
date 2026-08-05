@@ -79,6 +79,7 @@
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings" checked></div>
   <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
+  <div class="row"><label>Dynamic only</label><input type="range" id="dynmin" min="0" max="100" step="5" value="0"></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -162,13 +163,13 @@ vec3 cmap(int c, float t){
 
 const ptProg = compile(`#version 300 es
 precision highp float;
-in vec3 aPos; in float aRefl; in float aSig; in float aNir;
+in vec3 aPos; in float aRefl; in float aSig; in float aNir; in float aDyn;
 uniform mat4 uProj, uView;
-uniform float uPointSize, uLo, uHi, uAtten, uDpr;
+uniform float uPointSize, uLo, uHi, uAtten, uDpr, uDynMin;
 uniform int uMode;
 out float vT;
 void main(){
-  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; return; }
+  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; return; }
   vec4 eye = uView * vec4(aPos,1.0);
   gl_Position = uProj * eye;
   float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
@@ -191,9 +192,9 @@ void main(){
 const splatProg = compile(`#version 300 es
 precision highp float;
 in vec3 aPos; in float aRefl; in float aSig; in float aNir;
-in vec2 aNrm; in float aRad; in float aRad2; in float aPhi;
+in vec2 aNrm; in float aRad; in float aRad2; in float aPhi; in float aDyn;
 uniform mat4 uProj, uView;
-uniform float uLo, uHi, uRadMul, uFocal, uDpr, uMaxPx;
+uniform float uLo, uHi, uRadMul, uFocal, uDpr, uMaxPx, uDynMin;
 uniform int uMode;
 out float vT; out vec3 vC; out vec3 vN; out vec3 vE1; out vec3 vE2; out vec2 vSig;
 vec3 octDecode(vec2 e){
@@ -211,7 +212,8 @@ void onb(vec3 n, out vec3 t1, out vec3 t2){
   t2 = vec3(b, s + n.y*n.y*a, -n.y);
 }
 void main(){
-  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vE1=vec3(1,0,0); vE2=vec3(0,1,0); vSig=vec2(1e-6); return; }
+  // 会場スキャンに載る点は捨てる (動体だけを残す)
+  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vE1=vec3(1,0,0); vE2=vec3(0,1,0); vSig=vec2(1e-6); return; }
   vec4 eye = uView * vec4(aPos,1.0);
   gl_Position = uProj * eye;
   float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
@@ -276,10 +278,10 @@ void main(){
 // ビーム間の隙間はテクスチャのバイリニア補間が埋めるため縞も棘も出ない。
 const meshProg = compile(`#version 300 es
 precision highp float;
-in vec3 aPos; in vec2 aNrm;
+in vec3 aPos; in vec2 aNrm; in float aDyn;
 uniform mat4 uProj, uView;
 uniform int uW, uH;
-out vec2 vUv; out vec3 vN; out vec3 vC;
+out vec2 vUv; out vec3 vN; out vec3 vC; out float vDyn;
 vec3 octDecode(vec2 e){
   vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
   if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
@@ -293,14 +295,16 @@ void main(){
   vUv = vec2((float(id % uW)+0.5)/float(uW), (float(id / uW)+0.5)/float(uH));
   vN = mat3(uView) * octDecode(aNrm);
   vC = eye.xyz;
+  vDyn = aDyn;
 }`,`#version 300 es
 precision highp float;
-in vec2 vUv; in vec3 vN; in vec3 vC;
+in vec2 vUv; in vec3 vN; in vec3 vC; in float vDyn;
 uniform sampler2D uTex;
-uniform int uCmap; uniform float uShade; uniform vec3 uLightDir;
+uniform int uCmap; uniform float uShade; uniform vec3 uLightDir; uniform float uDynMin;
 out vec4 frag;
 ${CMAP_GLSL}
 void main(){
+  if (vDyn < uDynMin) discard;
   vec3 col = cmap(uCmap, texture(uTex, vUv).r);
   if (uShade > 0.001){
     vec3 nn = normalize(vN);
@@ -395,7 +399,7 @@ canvas.addEventListener("wheel",e=>{
 },{passive:false});
 
 // ---------- バッファ ----------
-let N=0, vao=null, posVBO, reflVBO, sigVBO, nirVBO, nrmVBO, radVBO, rad2VBO, phiVBO, idxVBO;
+let N=0, vao=null, posVBO, reflVBO, sigVBO, nirVBO, nrmVBO, radVBO, rad2VBO, phiVBO, dynVBO, idxVBO;
 let meshVao=null, meshIdxVBO=null, tex=null;
 function initBuffers(n){
   N=n;
@@ -413,6 +417,7 @@ function initBuffers(n){
   radVBO = mk(5,1,gl.UNSIGNED_BYTE,true,n);
   rad2VBO= mk(6,1,gl.UNSIGNED_BYTE,true,n);
   phiVBO = mk(7,1,gl.UNSIGNED_BYTE,true,n);
+  dynVBO = mk(8,1,gl.UNSIGNED_BYTE,false,n);
   idxVBO = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxVBO);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, n*4, gl.DYNAMIC_DRAW);
@@ -427,6 +432,8 @@ function initBuffers(n){
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER, nrmVBO);
   gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4,2,gl.BYTE,true,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, dynVBO);
+  gl.enableVertexAttribArray(8); gl.vertexAttribPointer(8,1,gl.UNSIGNED_BYTE,false,0,0);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, meshIdxVBO);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, (INFO.rows-1)*(INFO.cols-1)*6*4, gl.DYNAMIC_DRAW);
   gl.bindVertexArray(null);
@@ -479,6 +486,7 @@ for (const p of [ptProg, splatProg, meshProg]){
   gl.bindAttribLocation(p,2,"aSig"); gl.bindAttribLocation(p,3,"aNir");
   gl.bindAttribLocation(p,4,"aNrm"); gl.bindAttribLocation(p,5,"aRad");
   gl.bindAttribLocation(p,6,"aRad2"); gl.bindAttribLocation(p,7,"aPhi");
+  gl.bindAttribLocation(p,8,"aDyn");
   gl.linkProgram(p);
 }
 
@@ -486,6 +494,7 @@ function upload(fr){
   const up=(b,arr)=>{gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferSubData(gl.ARRAY_BUFFER,0,arr);};
   up(posVBO,fr.pos); up(reflVBO,fr.refl); up(sigVBO,fr.sig); up(nirVBO,fr.nir);
   up(nrmVBO,fr.nrm); up(radVBO,fr.rad); up(rad2VBO,fr.rad2); up(phiVBO,fr.phi);
+  up(dynVBO,fr.dyn);
 }
 
 // ---------- 深度ソート(スプラットのαブレンド用, 基数ソート) ----------
@@ -560,9 +569,10 @@ function parseFrame(buf){
   const rad = new Uint8Array(buf,o,n);     o += n;
   const rad2= new Uint8Array(buf,o,n);     o += n;   // 短軸
   const phi = new Uint8Array(buf,o,n);     o += n;   // 接平面内の長軸角 [0,π)
+  const dyn = new Uint8Array(buf,o,n);     o += n;   // 会場スキャン表面からの距離(cm)
   const nq  = new Uint32Array(buf,o,1)[0]; o += 4;   // 面として繋げる四角形の数
   const quads = new Uint32Array(buf,o,nq);           // 各四角形の左上頂点の通し番号
-  return {pos,refl,sig,nir,nrm,rad,rad2,phi,quads,t,n};
+  return {pos,refl,sig,nir,nrm,rad,rad2,phi,dyn,quads,t,n};
 }
 function getFrame(i){
   if (cache.has(i)) {
@@ -625,7 +635,7 @@ const ui = {
   atten:$("atten"), rings:$("rings"), play:$("play"), seek:$("seek"),
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
-  tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"),
+  tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
 };
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
@@ -873,6 +883,7 @@ function loop(tms){
       gl.uniform1i(u("uW"), INFO.cols); gl.uniform1i(u("uH"), INFO.rows);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
+      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
         view[0]*LW[0]+view[4]*LW[1]+view[8]*LW[2],
@@ -893,6 +904,7 @@ function loop(tms){
       gl.uniform1f(u("uRadMul"), +ui.radmul.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
+      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
       // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
@@ -923,6 +935,7 @@ function loop(tms){
       gl.uniformMatrix4fv(u("uView"),false,view);
       gl.uniform1f(u("uPointSize"), +ui.psize.value);
       gl.uniform1f(u("uAtten"), ui.atten.checked?1:0);
+      gl.uniform1f(u("uDynMin"), +ui.dynmin.value);
       gl.uniform1f(u("uDpr"), dpr);
       gl.uniform1i(u("uMode"), +ui.mode.value);
       gl.uniform1i(u("uCmap"), +ui.cmap.value);

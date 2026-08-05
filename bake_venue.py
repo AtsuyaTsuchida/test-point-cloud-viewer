@@ -146,6 +146,44 @@ def yaw_candidates(lidar_xyz, surf, off, zlo, zhi, half=25.6, cell=0.10, keep=12
     return out[:keep]
 
 
+def distance_grid(surf, cell=0.10, max_d=12):
+    """会場表面からの距離をボクセル単位で持つグリッド (uint8, 未到達は255)。
+    これを配れば、動体判定のしきい値を再計算なしで実行時に変えられる。"""
+    pad = cell * (max_d + 1)
+    o = surf.min(0) - pad
+    dims = np.ceil((surf.max(0) + pad - o) / cell).astype(np.int64) + 1
+    k = ((surf - o) / cell).astype(np.int64)
+    k = k[np.all((k >= 0) & (k < dims), axis=1)]
+    cur = np.zeros(tuple(dims), bool)
+    cur[k[:, 0], k[:, 1], k[:, 2]] = True
+    dist = np.full(tuple(dims), 255, np.uint8)
+    dist[cur] = 0
+    for d in range(1, max_d + 1):
+        nxt = cur.copy()
+        nxt[1:] |= cur[:-1]
+        nxt[:-1] |= cur[1:]
+        nxt[:, 1:] |= cur[:, :-1]
+        nxt[:, :-1] |= cur[:, 1:]
+        nxt[:, :, 1:] |= cur[:, :, :-1]
+        nxt[:, :, :-1] |= cur[:, :, 1:]
+        dist[nxt & ~cur] = d
+        cur = nxt
+    return dist, o
+
+
+def dist_lookup(dist, origin, cell, pts):
+    """各点の会場表面からの距離をcmで返す (グリッド外・未到達は255)。"""
+    dims = np.array(dist.shape)
+    k = ((pts - origin) / cell).astype(np.int64)
+    ok = np.all((k >= 0) & (k < dims), axis=1)
+    out = np.full(len(pts), 255, np.int32)
+    kk = k[ok]
+    v = dist[kk[:, 0], kk[:, 1], kk[:, 2]].astype(np.int32)
+    out[ok] = np.where(v == 255, 255,
+                       np.minimum(v * int(round(cell * 100)), 254))
+    return out.astype(np.uint8)
+
+
 def bake_colors(verts, gxyz, grgb, vox=0.08, rings=2):
     """各頂点の近傍ボクセルにあるガウシアンの平均色を割り当てる。"""
     origin = gxyz.min(0) - vox
@@ -289,14 +327,26 @@ def main():
               f"{100.0*(mk[p]==q).mean():.1f}%  "
               f"[bbox内 {100.0*inb.mean():.0f}%]")
 
-    print("[4/4] baking colors from 3DGS ...")
+    print("[4/5] baking colors from 3DGS ...")
     col, found = bake_colors(v_l, g_l, grgb)
     print(f"  colored {100.0*found.mean():.1f}% of vertices")
+
+    print("[5/5] building distance grid (for dynamic-only extraction) ...")
+    dist, dorg = distance_grid(surf_l)
+    hit = (dist < 255)
+    print(f"  grid {tuple(dist.shape)} @10cm  "
+          f"({dist.nbytes/1e6:.1f} MB, {100.0*hit.mean():.1f}% within 1.2 m)")
+    probe_d = dist_lookup(dist, dorg, 0.10, lid)
+    for thr in (10, 20, 30, 40):
+        print(f"  静止LiDAR点のうち会場から{thr:3d}cm超: "
+              f"{100.0*(probe_d > thr).mean():.1f}%")
 
     np.savez_compressed(args.out,
                         verts=v_l.astype(np.float32),
                         colors=col.astype(np.float32),
                         faces=faces.astype(np.uint32),
+                        dist=dist, dist_origin=dorg.astype(np.float32),
+                        dist_cell=np.float32(0.10),
                         yaw_deg=np.float32(deg), txy=t.astype(np.float32),
                         dz=np.float32(dz))
     print(f"saved: {args.out}  ({os.path.getsize(args.out)/1e6:.1f} MB)")
