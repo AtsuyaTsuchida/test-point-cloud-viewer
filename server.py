@@ -23,10 +23,22 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+RAW_CACHE = 48           # 生の距離画像のLRU段数 (時間中央値フィルタ用, 約1.2MB/枚)
+TAN_MAX = 3.0            # 面とみなす最大入射角 tan (72°) — 法線の有効判定に使う
+MESH_TAN = 12.0          # メッシュの面連続判定 tan (85°)。斜入射でも面は繋げる。
+REL_NOISE = 0.02         # レンジノイズぶんの相対マージン
+SIG_CAP_K = 0.010        # σの距離比上限。斜入射面の標本間隔は1m超になるため、
+SIG_CAP_B = 0.005        # 忠実に覆うと筋状に伸びる。覆いきらず隙間を残す方を選ぶ。
+                         # 値はフォールバック半径 rr*0.0092 に合わせてある。
+MAX_ASPECT = 2.0         # 楕円の最大扁平率
+LOG_R_BASE = 1.0182      # 半径のu8対数エンコード: r = 0.004 * BASE**k
+LOG_R_MIN = 0.004
 
 DEFAULT_DIR = os.path.join(
     os.path.dirname(HERE),
@@ -62,6 +74,27 @@ class OusterPcap:
         f = open(pcap_path, "rb")
         self.mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
+        self._raw = {}                 # frame idx -> (rng, refl, sig, nir)
+        self._raw_order = []
+        self._raw_lock = threading.Lock()
+
+        # OS-DOME-128 の beam_altitude_angles は空間順ではなく列内でインターリーブ
+        # されている(隣接要素が5°飛ぶ、符号反転27回)。行を仰角順に並べ替えないと
+        # 「隣の行」が空間的な隣にならず、法線も面の接続も成立しない。
+        alt_raw = np.deg2rad(np.asarray(
+            self.meta["beam_intrinsics"]["beam_altitude_angles"], np.float64))
+        self.row_perm = np.argsort(alt_raw)[::-1].copy()    # 上(仰角大)から下へ
+        alt = alt_raw[self.row_perm]
+
+        # 深度エッジ判定用の角度ステップ(隣接±1本ぶん)。ビーム間隔は0.02°〜2.06°と
+        # 一様でないので行ごとに持つ。
+        sv = np.empty(self.H)
+        sv[1:-1] = np.abs(alt[2:] - alt[:-2])
+        sv[0] = abs(alt[1] - alt[0])
+        sv[-1] = abs(alt[-1] - alt[-2])
+        self.step_v = sv.astype(np.float32)
+        self.step_u = np.float32(2.0 * (2.0 * np.pi / self.W))
+
         self._build_lut()
         self._index()
 
@@ -72,8 +105,11 @@ class OusterPcap:
     # --- XYZ変換ルックアップテーブル (ouster-sdk make_xyz_lut と同じ式) ---
     def _build_lut(self):
         bi = self.meta["beam_intrinsics"]
-        alt = np.deg2rad(np.asarray(bi["beam_altitude_angles"], np.float64))
-        az = -np.deg2rad(np.asarray(bi["beam_azimuth_angles"], np.float64))
+        # 行は仰角順に並べ替えた順序で構築する (self.row_perm と一致させること)
+        alt = np.deg2rad(np.asarray(bi["beam_altitude_angles"],
+                                    np.float64))[self.row_perm]
+        az = -np.deg2rad(np.asarray(bi["beam_azimuth_angles"],
+                                    np.float64))[self.row_perm]
         b = np.asarray(bi["beam_to_lidar_transform"], np.float64).reshape(4, 4)
         n = float(np.hypot(b[0, 3], b[2, 3]))
 
@@ -167,8 +203,15 @@ class OusterPcap:
     def n_frames(self):
         return len(self.frame_start)
 
-    # --- 1フレームをデコードして点群バイナリを返す ---
-    def decode(self, i):
+    # --- 1フレーム分の距離画像をデコード (LRUキャッシュ付き) ---
+    def _decode_raw(self, i):
+        with self._raw_lock:
+            hit = self._raw.get(i)
+            if hit is not None:
+                self._raw_order.remove(i)
+                self._raw_order.append(i)
+                return hit
+
         s = int(self.frame_start[i])
         c = int(self.frame_count[i])
         H, W, CPP = self.H, self.W, self.cols_per_packet
@@ -193,20 +236,119 @@ class OusterPcap:
             sig[:, mids] = np.ascontiguousarray(px[:, :, 6:8]).view("<u2")[..., 0].T
             nir[:, mids] = np.ascontiguousarray(px[:, :, 8:10]).view("<u2")[..., 0].T
 
+        # 物理チャンネル順 → 仰角順。LUTも同じ並びで作ってある。
+        p = self.row_perm
+        out = (rng[p], refl[p], sig[p], nir[p])
+        with self._raw_lock:
+            self._raw[i] = out
+            if i in self._raw_order:
+                self._raw_order.remove(i)
+            self._raw_order.append(i)
+            while len(self._raw_order) > RAW_CACHE:
+                self._raw.pop(self._raw_order.pop(0), None)
+        return out
+
+    # --- 時間方向の中央値でレンジノイズを落とす (静止センサー前提) ---
+    def _median_range(self, i, tm):
+        k = tm // 2
+        idx = [j for j in range(i - k, i + k + 1) if 0 <= j < self.n_frames]
+        st = np.stack([self._decode_raw(j)[0] for j in idx]).astype(np.float32)
+        st[st == 0] = np.inf          # 無効点は末尾へ送り中央値の対象外にする
+        st.sort(axis=0)
+        valid = np.isfinite(st).sum(0)
+        mid = (np.maximum(valid - 1, 0) // 2).astype(np.intp)
+        med = np.take_along_axis(st, mid[None], 0)[0]
+        med[valid == 0] = 0.0
+        return med.astype(np.uint32)
+
+    # --- 1フレームをデコードして点群バイナリを返す ---
+    def decode(self, i, tm=1):
+        rng, refl, sig, nir = self._decode_raw(i)
+        if tm > 1:
+            rng = self._median_range(i, tm)
+
         xyz = self.lut_dir * rng[None].astype(np.float32) + self.lut_off  # (3,H,W)
         xyz[:, rng == 0] = 0.0   # 無効点は原点に置き、クライアント側で捨てる
 
-        normal, radius = self._surfels(xyz, rng)
+        normal, rad_maj, rad_min, phi = self._surfels(xyz, rng)
 
         pts = np.ascontiguousarray(np.moveaxis(xyz, 0, -1).reshape(-1, 3),
                                    np.float32)
+        quads = self._quads(rng)
         t_rel = float(self.frame_ts[i] - self.frame_ts[0])
-        header = struct.pack("<4sIff", b"OPC2", pts.shape[0], t_rel, self.fps)
+        header = struct.pack("<4sIff", b"OPC4", pts.shape[0], t_rel, self.fps)
         return b"".join([header, pts.tobytes(),
                          refl.reshape(-1).tobytes(),
                          sig.reshape(-1).astype("<u2").tobytes(),
                          nir.reshape(-1).astype("<u2").tobytes(),
-                         normal.tobytes(), radius.tobytes()])
+                         normal.tobytes(), rad_maj.tobytes(),
+                         rad_min.tobytes(), phi.tobytes(),
+                         struct.pack("<I", quads.shape[0]), quads.tobytes()])
+
+    # --- レンジ画像の格子から、面として繋いでよい四角形パッチを列挙する ---
+    # グリッド接続性を使うとビーム間の隙間がテクスチャ補間で埋まり、独立した
+    # スプラットで生じる穴と棘の両方が同時に消える。
+    def _quads(self, rng):
+        H, W = self.H, self.W
+        rf = rng.astype(np.float32)
+        a = rf[:-1, :-1]                 # (h,w)      左上
+        b = rf[:-1, 1:]                  # (h,w+1)    右上
+        c = rf[1:, :-1]                  # (h+1,w)    左下
+        d = rf[1:, 1:]                   # (h+1,w+1)  右下
+        ok = (a > 0) & (b > 0) & (c > 0) & (d > 0)
+        mx = np.maximum(np.maximum(a, b), np.maximum(c, d))
+        mn = np.minimum(np.minimum(a, b), np.minimum(c, d))
+        # 面の連続判定は法線の有効判定より緩くする。ドーム型センサーが天井や床を
+        # 見ると仰角10°付近で隣接ビームのレンジ差が2.4mに達するが、これは滑らかな
+        # 変化であって遮蔽境界ではない。ここで切ると面が短冊に割れる。
+        thr = (MESH_TAN * (self.step_u + self.step_v[:-1]) * 0.5 + REL_NOISE)[:, None]
+        ok &= (mx - mn) <= thr * np.maximum(mn, 1.0)
+        # 方位の継ぎ目(w=W-1→0)はUVが逆走するので列ごと落とす
+        hh, ww = np.nonzero(ok)
+        return (hh.astype(np.uint32) * W + ww.astype(np.uint32))
+
+    # --- 法線のoctahedronエンコード/デコード (GLSL octDecode と同一) ---
+    @staticmethod
+    def _oct_encode(n):
+        ax, ay, az = np.abs(n)
+        s = np.maximum(ax + ay + az, 1e-9)
+        u, v = n[0] / s, n[1] / s
+        neg = n[2] < 0
+        su = np.where(u >= 0, 1.0, -1.0)
+        sv = np.where(v >= 0, 1.0, -1.0)
+        uo = np.where(neg, (1.0 - np.abs(v)) * su, u)
+        vo = np.where(neg, (1.0 - np.abs(u)) * sv, v)
+        o = np.clip(np.stack([uo, vo], -1) * 127.0, -127, 127)
+        return np.round(o).astype(np.int8)
+
+    @staticmethod
+    def _oct_decode(oct8, shape):
+        e = oct8.astype(np.float32) / 127.0
+        x = e[..., 0].reshape(shape)
+        y = e[..., 1].reshape(shape)
+        z = 1.0 - np.abs(x) - np.abs(y)
+        neg = z < 0
+        sx = np.where(x >= 0, 1.0, -1.0)
+        sy = np.where(y >= 0, 1.0, -1.0)
+        nx = np.where(neg, (1.0 - np.abs(y)) * sx, x)
+        ny = np.where(neg, (1.0 - np.abs(x)) * sy, y)
+        n = np.stack([nx, ny, z]).astype(np.float32)
+        return n / np.maximum(np.linalg.norm(n, axis=0), 1e-9)
+
+    # --- 法線から一意な接線基底 (Duff et al. 2017, GLSL側と同一式) ---
+    @staticmethod
+    def _onb(n):
+        s = np.where(n[2] >= 0.0, 1.0, -1.0).astype(np.float32)
+        a = -1.0 / (s + n[2])
+        b = n[0] * n[1] * a
+        t1 = np.stack([1.0 + s * n[0] * n[0] * a, s * b, -s * n[0]])
+        t2 = np.stack([b, s + n[1] * n[1] * a, -n[1]])
+        return t1, t2
+
+    @staticmethod
+    def _log8(r):
+        k = np.log(np.maximum(r, LOG_R_MIN) / LOG_R_MIN) / np.log(LOG_R_BASE)
+        return np.clip(np.round(k), 0, 255).astype(np.uint8).reshape(-1)
 
     # --- 距離画像の隣接点からサーフェル(法線+半径)を推定 ---
     def _surfels(self, P, rng):
@@ -231,42 +373,83 @@ class OusterPcap:
         vv[0] = V[1]
         vv[-1] = V[-2]
         good &= vv
-        lu_n = np.linalg.norm(du, axis=0)
-        lv_n = np.linalg.norm(dv, axis=0)
         rr = rng.astype(np.float32) / 1000.0
-        # 期待される隣接間隔(≈0.012×距離)の数倍を超えたら深度エッジとみなす
-        good &= (lu_n < rr * 0.06) & (lv_n < rr * 0.08)
+        # 深度エッジ判定はレンジの相対差で行う。3次元距離を見ると斜入射の面ほど
+        # 隣接点が離れるため、このドーム型センサーでは面までエッジ扱いになり
+        # 有効法線が全体の0.9%まで落ちていた。閾値は角度ステップ×tan(最大入射角)。
+        rf = rng.astype(np.float32)
+        den = np.maximum(rf, 1.0)
+        dru = np.abs(np.roll(rf, -1, axis=1) - np.roll(rf, 1, axis=1)) / den
+        drv = np.empty_like(rf)
+        drv[1:-1] = np.abs(rf[2:] - rf[:-2])
+        drv[0] = np.abs(rf[1] - rf[0])
+        drv[-1] = np.abs(rf[-1] - rf[-2])
+        drv /= den
+        good &= (dru < TAN_MAX * self.step_u + REL_NOISE)
+        good &= (drv < (TAN_MAX * self.step_v + REL_NOISE)[:, None])
 
         # 法線が取れない点はセンサ方向を向いたビルボード扱い
         pl = np.maximum(np.linalg.norm(P, axis=0), 1e-9)
         fb = -P / pl
         n_unit = np.where(good, nrm / np.maximum(ln, 1e-9), fb).astype(np.float32)
 
-        r = 0.35 * np.maximum(lu_n, lv_n)
-        r = np.minimum(r, rr * 0.02 + 0.01)     # 距離に応じた上限で巨大化を防ぐ
+        # 法線は先に量子化する。シェーダは量子化後の値から接線基底を作るので、
+        # 角度phiも同じ基底で測らないと楕円の向きがずれる。
+        oct8 = self._oct_encode(n_unit)
+        n_q = self._oct_decode(oct8, (H, W))
+        t1, t2 = self._onb(n_q)
+
+        # 方位/ビーム方向の半間隔ベクトルを接平面へ射影し、2次モーメントの
+        # 主軸を楕円の軸に取る。標本間隔は方向で最大5.9倍違うため、等方円だと
+        # 縦に隙間が残り横に過剰ににじむ。
+        au, av = (du * t1).sum(0) * 0.5, (du * t2).sum(0) * 0.5
+        bu, bv = (dv * t1).sum(0) * 0.5, (dv * t2).sum(0) * 0.5
+        c00 = au * au + bu * bu
+        c11 = av * av + bv * bv
+        c01 = au * av + bu * bv
+        disc = np.sqrt(np.maximum(0.25 * (c00 - c11) ** 2 + c01 * c01, 0.0))
+        half = 0.5 * (c00 + c11)
+        K = 0.7                              # 半間隔→σ (従来の 0.35*|d| と同スケール)
+        r1 = K * np.sqrt(np.maximum(half + disc, 0.0))
+        r2 = K * np.sqrt(np.maximum(half - disc, 0.0))
+        phi = 0.5 * np.arctan2(2.0 * c01, c00 - c11)
+
+        # 標本形状に忠実な扁平率は斜入射面で15倍を超え、描画では棘状に破綻する。
+        # 穏やかな異方性に留め、覆いきれないぶんは隙間として残す。
+        cap = rr * SIG_CAP_K + SIG_CAP_B
+        r1 = np.minimum(r1, cap)
+        r2 = np.minimum(np.maximum(r2, r1 / MAX_ASPECT), cap)
         r_fb = rr * (2.0 * np.pi / W) * 1.5
-        r = np.where(good, r, r_fb)
-        np.clip(r, 0.004, 0.3, out=r)
+        r1 = np.where(good, r1, r_fb)
+        r2 = np.where(good, r2, r_fb)
+        phi = np.where(good, phi, 0.0)
+        np.clip(r1, 0.004, 0.4, out=r1)
+        np.clip(r2, 0.004, 0.4, out=r2)
 
-        # 法線: octahedronエンコードでint8×2 / 半径: 対数スケールでu8
-        ax, ay, az = np.abs(n_unit)
-        s = np.maximum(ax + ay + az, 1e-9)
-        u = n_unit[0] / s
-        v = n_unit[1] / s
-        neg = n_unit[2] < 0
-        su = np.where(u >= 0, 1.0, -1.0)
-        sv = np.where(v >= 0, 1.0, -1.0)
-        uo = np.where(neg, (1.0 - np.abs(v)) * su, u)
-        vo = np.where(neg, (1.0 - np.abs(u)) * sv, v)
-        oct8 = np.clip(np.stack([uo, vo], -1) * 127.0, -127, 127)
-        oct8 = np.round(oct8).astype(np.int8).reshape(H * W, 2)
+        # 楕円はπ周期なので phi は [0,π) に畳んで u8 に載せる
+        ph8 = np.clip(np.round(np.mod(phi, np.pi) / np.pi * 255.0), 0, 255)
+        return (oct8.reshape(H * W, 2), self._log8(r1), self._log8(r2),
+                ph8.astype(np.uint8).reshape(-1))
 
-        k = np.log(r / 0.004) / np.log(1.0182)
-        rad8 = np.clip(np.round(k), 0, 255).astype(np.uint8).reshape(-1)
-        return oct8, rad8
+
+def load_venue():
+    """bake_venue.py が焼いた会場メッシュ (LiDAR座標系, 頂点カラー付き)。"""
+    p = os.path.join(HERE, "venue.npz")
+    if not os.path.exists(p):
+        return None
+    z = np.load(p)
+    v = z["verts"].astype(np.float32)
+    c = np.clip(z["colors"] * 255.0, 0, 255).astype(np.uint8)
+    f = z["faces"].astype(np.uint32)
+    print(f"Venue mesh: {len(v)} verts / {len(f)} tris "
+          f"(yaw {float(z['yaw_deg']):.2f} deg)")
+    return b"".join([struct.pack("<4sII", b"VNU1", len(v), len(f)),
+                     v.tobytes(), np.ascontiguousarray(c).tobytes(),
+                     f.tobytes()])
 
 
 def make_handler(src: OusterPcap):
+    venue = load_venue()
     info = {
         "n_frames": src.n_frames,
         "fps": src.fps,
@@ -303,11 +486,20 @@ def make_handler(src: OusterPcap):
                         self._send(200, "text/html; charset=utf-8", fh.read())
                 elif self.path == "/info":
                     self._send(200, "application/json", info_json)
+                elif self.path == "/venue":
+                    if venue is None:
+                        self._send(404, "text/plain", b"run bake_venue.py first")
+                    else:
+                        self._send(200, "application/octet-stream", venue,
+                                   cache=True)
                 elif self.path.startswith("/frame/"):
-                    i = int(self.path.split("/")[2])
+                    u = urlparse(self.path)
+                    i = int(u.path.split("/")[2])
+                    tm = int(parse_qs(u.query).get("tm", ["1"])[0])
+                    tm = max(1, min(15, tm | 1))    # 中央値を取るため奇数に丸める
                     if 0 <= i < src.n_frames:
                         self._send(200, "application/octet-stream",
-                                   src.decode(i), cache=True)
+                                   src.decode(i, tm), cache=True)
                     else:
                         self._send(404, "text/plain", b"frame out of range")
                 else:

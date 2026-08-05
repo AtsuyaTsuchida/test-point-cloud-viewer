@@ -44,6 +44,7 @@
   <div class="row"><label>Render</label>
     <select id="rmode">
       <option value="1" selected>Splats</option>
+      <option value="2">Mesh</option>
       <option value="0">Points</option>
     </select></div>
   <div class="row"><label>Color</label>
@@ -64,10 +65,20 @@
     </select></div>
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
-  <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.1" value="1.2"></div>
+  <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.05" value="0.85"></div>
   <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.3" max="1" step="0.05" value="1"></div>
+  <div class="row"><label>Shading</label><input type="range" id="shade" min="0" max="1" step="0.05" value="0.7"></div>
+  <div class="row"><label>Temporal median</label>
+    <select id="tmed">
+      <option value="1" selected>Off</option>
+      <option value="3">3 frames</option>
+      <option value="5">5 frames</option>
+      <option value="9">9 frames</option>
+    </select></div>
   <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings" checked></div>
+  <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
+  <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -180,57 +191,149 @@ void main(){
 const splatProg = compile(`#version 300 es
 precision highp float;
 in vec3 aPos; in float aRefl; in float aSig; in float aNir;
-in vec2 aNrm; in float aRad;
+in vec2 aNrm; in float aRad; in float aRad2; in float aPhi;
 uniform mat4 uProj, uView;
-uniform float uLo, uHi, uRadMul, uFocal, uDpr;
+uniform float uLo, uHi, uRadMul, uFocal, uDpr, uMaxPx;
 uniform int uMode;
-out float vT; out vec3 vC; out vec3 vN; out float vR;
+out float vT; out vec3 vC; out vec3 vN; out vec3 vE1; out vec3 vE2; out vec2 vSig;
 vec3 octDecode(vec2 e){
   vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
   if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
   return normalize(v);
 }
+// 法線から一意な接線基底 (Duff et al. 2017) — server._onb と同一式でなければ
+// 楕円の向きがずれるので、両者を必ず揃えること
+void onb(vec3 n, out vec3 t1, out vec3 t2){
+  float s = n.z >= 0.0 ? 1.0 : -1.0;
+  float a = -1.0 / (s + n.z);
+  float b = n.x * n.y * a;
+  t1 = vec3(1.0 + s*n.x*n.x*a, s*b, -s*n.x);
+  t2 = vec3(b, s + n.y*n.y*a, -n.y);
+}
 void main(){
-  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vR=0.0; return; }
+  if (dot(aPos,aPos) < 1e-9){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vE1=vec3(1,0,0); vE2=vec3(0,1,0); vSig=vec2(1e-6); return; }
   vec4 eye = uView * vec4(aPos,1.0);
   gl_Position = uProj * eye;
   float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
             (uMode==3)?aPos.z : length(aPos);
   vT = (v - uLo) / max(uHi - uLo, 1e-6);
-  float r = 0.004 * pow(1.0182, aRad*255.0) * uRadMul;
-  vR = r; vC = eye.xyz;
-  vN = mat3(uView) * octDecode(aNrm);
-  float rpx = r * uFocal / max(-eye.z, 0.05);
-  gl_PointSize = clamp(rpx*4.0, 2.0, 120.0) * uDpr;
+  float r1 = 0.004 * pow(1.0182, aRad *255.0) * uRadMul;
+  float r2 = 0.004 * pow(1.0182, aRad2*255.0) * uRadMul;
+  vSig = vec2(r1, r2) * 0.75;
+  vC = eye.xyz;
+  vec3 n = octDecode(aNrm);
+  vN = mat3(uView) * n;
+  vec3 t1, t2; onb(n, t1, t2);
+  float ph = aPhi * 3.14159265;            // [0,1) → [0,π) 楕円はπ周期
+  float cp = cos(ph), sp = sin(ph);
+  vE1 = mat3(uView) * ( cp*t1 + sp*t2);
+  vE2 = mat3(uView) * (-sp*t1 + cp*t2);
+  float rpx = max(r1, r2) * uFocal / max(-eye.z, 0.05);
+  // 素のガウシアンは裾が広いので 2.8σ(=2.1r) まで覆う矩形を確保する
+  gl_PointSize = clamp(rpx*5.0, 2.0, uMaxPx) * uDpr;
 }`,`#version 300 es
 precision highp float;
-in float vT; in vec3 vC; in vec3 vN; in float vR;
+in float vT; in vec3 vC; in vec3 vN; in vec3 vE1; in vec3 vE2; in vec2 vSig;
 uniform vec2 uVp; uniform vec2 uPxy;
-uniform int uCmap; uniform float uOpacity;
+uniform int uCmap; uniform float uOpacity; uniform float uShade;
+uniform vec3 uLightDir;
 out vec4 frag;
 ${CMAP_GLSL}
 void main(){
   vec2 ndc = (gl_FragCoord.xy / uVp) * 2.0 - 1.0;
   vec3 d = vec3(ndc.x/uPxy.x, ndc.y/uPxy.y, -1.0);
   float nd = dot(vN, d);
-  float dist2;
+  vec3 q;
   if (abs(nd) > 0.12 * length(d)) {
-    // 接平面との交点までの面内距離 → 遠近で正しく歪む楕円になる
+    // 接平面との交点までの面内ベクトル → 遠近で正しく歪む楕円になる
     float t = dot(vN, vC) / nd;
     if (t < 0.0) discard;
-    vec3 q = d*t - vC;
-    dist2 = dot(q,q);
+    q = d*t - vC;
   } else {
     // ほぼ真横から見た面はビルボードにフォールバック
     vec3 dn = normalize(d);
-    vec3 q = vC - dn*dot(vC,dn);
-    dist2 = dot(q,q);
+    q = vC - dn*dot(vC,dn);
   }
-  float sg = vR * 0.65;
-  float u2 = dist2/(sg*sg);
-  float a = exp(-0.5 * u2*u2) * uOpacity;   // 中心が平坦なスーパーガウシアン
-  if (a < 0.03) discard;
-  frag = vec4(cmap(uCmap, clamp(vT,0.0,1.0)) * a, a);
+  // 主軸に沿った異方性ガウシアン (3DGS準拠)。標本間隔が方向で最大4倍違うため、
+  // 等方円だと縦に隙間が残り横に過剰ににじむ。
+  float x = dot(q, vE1), y = dot(q, vE2);
+  float a = exp(-0.5 * ((x*x)/(vSig.x*vSig.x) + (y*y)/(vSig.y*vSig.y))) * uOpacity;
+  if (a < 0.02) discard;
+  vec3 col = cmap(uCmap, clamp(vT,0.0,1.0));
+  if (uShade > 0.001){
+    // 法線はセンサー方向に反転済みなので、視線ではなくワールド固定の平行光で陰影を付ける
+    vec3 nn = normalize(vN);
+    float ndl = max(dot(nn, uLightDir), 0.0);
+    float ndv = abs(dot(nn, normalize(-vC)));
+    vec3 lit = col * (0.30 + 0.90*ndl)
+             + pow(1.0-ndv, 3.0) * 0.25 * vec3(0.55,0.68,1.0);
+    col = mix(col, lit, uShade);
+  }
+  frag = vec4(col * a, a);
+}`);
+
+// レンジ画像の格子をそのまま三角形に張り、SIGNAL/NIR等を貼るローポリメッシュ。
+// ビーム間の隙間はテクスチャのバイリニア補間が埋めるため縞も棘も出ない。
+const meshProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; in vec2 aNrm;
+uniform mat4 uProj, uView;
+uniform int uW, uH;
+out vec2 vUv; out vec3 vN; out vec3 vC;
+vec3 octDecode(vec2 e){
+  vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+  if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
+  return normalize(v);
+}
+void main(){
+  vec4 eye = uView * vec4(aPos,1.0);
+  gl_Position = uProj * eye;
+  // UVは頂点番号から直接引ける (属性を増やす必要がない)
+  int id = gl_VertexID;
+  vUv = vec2((float(id % uW)+0.5)/float(uW), (float(id / uW)+0.5)/float(uH));
+  vN = mat3(uView) * octDecode(aNrm);
+  vC = eye.xyz;
+}`,`#version 300 es
+precision highp float;
+in vec2 vUv; in vec3 vN; in vec3 vC;
+uniform sampler2D uTex;
+uniform int uCmap; uniform float uShade; uniform vec3 uLightDir;
+out vec4 frag;
+${CMAP_GLSL}
+void main(){
+  vec3 col = cmap(uCmap, texture(uTex, vUv).r);
+  if (uShade > 0.001){
+    vec3 nn = normalize(vN);
+    float ndl = max(dot(nn, uLightDir), 0.0);
+    float ndv = abs(dot(nn, normalize(-vC)));
+    vec3 lit = col * (0.30 + 0.90*ndl)
+             + pow(1.0-ndv, 3.0) * 0.25 * vec3(0.55,0.68,1.0);
+    col = mix(col, lit, uShade);
+  }
+  frag = vec4(col, 1.0);
+}`);
+
+// 事前スキャンした会場のローポリメッシュ。3DGSから焼いた頂点カラーを持ち、
+// bake_venue.py で既にLiDAR座標系へ変換済み。
+const venueProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; in vec3 aCol;
+uniform mat4 uProj, uView;
+out vec3 vCol; out vec3 vC;
+void main(){
+  vec4 eye = uView * vec4(aPos,1.0);
+  gl_Position = uProj * eye;
+  vCol = aCol; vC = eye.xyz;
+}`,`#version 300 es
+precision highp float;
+in vec3 vCol; in vec3 vC;
+uniform float uDim;
+out vec4 frag;
+void main(){
+  // 面法線は持たないので画面微分から起こす (ローポリの面が読めるようになる)
+  vec3 nn = normalize(cross(dFdx(vC), dFdy(vC)));
+  float ndv = abs(nn.z);
+  frag = vec4(vCol * uDim * (0.55 + 0.45*ndv), 1.0);
 }`);
 
 const lineProg = compile(`#version 300 es
@@ -292,7 +395,8 @@ canvas.addEventListener("wheel",e=>{
 },{passive:false});
 
 // ---------- バッファ ----------
-let N=0, vao=null, posVBO, reflVBO, sigVBO, nirVBO, nrmVBO, radVBO, idxVBO;
+let N=0, vao=null, posVBO, reflVBO, sigVBO, nirVBO, nrmVBO, radVBO, rad2VBO, phiVBO, idxVBO;
+let meshVao=null, meshIdxVBO=null, tex=null;
 function initBuffers(n){
   N=n;
   vao = gl.createVertexArray(); gl.bindVertexArray(vao);
@@ -307,22 +411,81 @@ function initBuffers(n){
   nirVBO = mk(3,1,gl.UNSIGNED_SHORT,true,n*2);
   nrmVBO = mk(4,2,gl.BYTE,true,n*2);
   radVBO = mk(5,1,gl.UNSIGNED_BYTE,true,n);
+  rad2VBO= mk(6,1,gl.UNSIGNED_BYTE,true,n);
+  phiVBO = mk(7,1,gl.UNSIGNED_BYTE,true,n);
   idxVBO = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxVBO);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, n*4, gl.DYNAMIC_DRAW);
   gl.bindVertexArray(null);
+
+  // メッシュ用は別VAO。ELEMENT_ARRAY_BUFFERの束縛はVAO状態なので、
+  // 同じVAOで差し替えるとスプラットの深度ソート用インデックスが壊れる。
+  meshIdxVBO = gl.createBuffer();
+  meshVao = gl.createVertexArray();
+  gl.bindVertexArray(meshVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, posVBO);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, nrmVBO);
+  gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4,2,gl.BYTE,true,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, meshIdxVBO);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, (INFO.rows-1)*(INFO.cols-1)*6*4, gl.DYNAMIC_DRAW);
+  gl.bindVertexArray(null);
+
+  // レンジ画像と同じ格子のテクスチャ (1024x128)。線形補間で隙間を埋める。
+  tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, INFO.cols, INFO.rows);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
 }
-for (const p of [ptProg, splatProg]){
+
+// --- メッシュのインデックス構築 & テクスチャ更新 ---
+let meshIdx=null, meshCount=0, meshFrame=-1, texBuf=null;
+function buildMeshIdx(fr){
+  const W = INFO.cols, q = fr.quads, m = q.length;
+  if (!meshIdx || meshIdx.length < m*6) meshIdx = new Uint32Array(m*6);
+  let o=0;
+  for (let k=0;k<m;k++){
+    const i00=q[k], i10=i00+W;
+    meshIdx[o++]=i00; meshIdx[o++]=i10;   meshIdx[o++]=i00+1;
+    meshIdx[o++]=i00+1; meshIdx[o++]=i10; meshIdx[o++]=i10+1;
+  }
+  meshCount = m*6;
+  gl.bindVertexArray(meshVao);
+  gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, meshIdx, 0, meshCount);
+  gl.bindVertexArray(null);
+}
+function updateTex(fr, mode){
+  const n=fr.n, lo=levels.lo, sp=Math.max(levels.hi-levels.lo,1e-6);
+  if (!texBuf || texBuf.length!==n) texBuf=new Uint8Array(n);
+  for (let i=0;i<n;i++){
+    let v;
+    if(mode===0) v=fr.refl[i]/255;
+    else if(mode===1) v=fr.sig[i]/65535;
+    else if(mode===2) v=fr.nir[i]/65535;
+    else if(mode===3) v=fr.pos[i*3+2];
+    else v=Math.hypot(fr.pos[i*3],fr.pos[i*3+1],fr.pos[i*3+2]);
+    const t=(v-lo)/sp;
+    texBuf[i] = t<=0 ? 0 : t>=1 ? 255 : (t*255)|0;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,INFO.cols,INFO.rows,gl.RED,gl.UNSIGNED_BYTE,texBuf);
+}
+for (const p of [ptProg, splatProg, meshProg]){
   gl.bindAttribLocation(p,0,"aPos"); gl.bindAttribLocation(p,1,"aRefl");
   gl.bindAttribLocation(p,2,"aSig"); gl.bindAttribLocation(p,3,"aNir");
   gl.bindAttribLocation(p,4,"aNrm"); gl.bindAttribLocation(p,5,"aRad");
+  gl.bindAttribLocation(p,6,"aRad2"); gl.bindAttribLocation(p,7,"aPhi");
   gl.linkProgram(p);
 }
 
 function upload(fr){
   const up=(b,arr)=>{gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferSubData(gl.ARRAY_BUFFER,0,arr);};
   up(posVBO,fr.pos); up(reflVBO,fr.refl); up(sigVBO,fr.sig); up(nirVBO,fr.nir);
-  up(nrmVBO,fr.nrm); up(radVBO,fr.rad);
+  up(nrmVBO,fr.nrm); up(radVBO,fr.rad); up(rad2VBO,fr.rad2); up(phiVBO,fr.phi);
 }
 
 // ---------- 深度ソート(スプラットのαブレンド用, 基数ソート) ----------
@@ -382,6 +545,7 @@ const order = [];                 // LRU
 const MAX_CACHE = 280;            // ≈ 600MB
 const inflight = new Map();       // idx -> Promise
 let INFO=null;
+let TMED=1;                       // 時間中央値フィルタの枚数 (1=off)
 
 function parseFrame(buf){
   const dv = new DataView(buf);
@@ -393,8 +557,12 @@ function parseFrame(buf){
   const sig = new Uint16Array(buf,o,n);    o += n*2;
   const nir = new Uint16Array(buf,o,n);    o += n*2;
   const nrm = new Int8Array(buf,o,n*2);    o += n*2;
-  const rad = new Uint8Array(buf,o,n);
-  return {pos,refl,sig,nir,nrm,rad,t,n};
+  const rad = new Uint8Array(buf,o,n);     o += n;
+  const rad2= new Uint8Array(buf,o,n);     o += n;   // 短軸
+  const phi = new Uint8Array(buf,o,n);     o += n;   // 接平面内の長軸角 [0,π)
+  const nq  = new Uint32Array(buf,o,1)[0]; o += 4;   // 面として繋げる四角形の数
+  const quads = new Uint32Array(buf,o,nq);           // 各四角形の左上頂点の通し番号
+  return {pos,refl,sig,nir,nrm,rad,rad2,phi,quads,t,n};
 }
 function getFrame(i){
   if (cache.has(i)) {
@@ -402,7 +570,7 @@ function getFrame(i){
     return Promise.resolve(cache.get(i));
   }
   if (inflight.has(i)) return inflight.get(i);
-  const p = fetch("/frame/"+i).then(r=>{
+  const p = fetch("/frame/"+i+"?tm="+TMED).then(r=>{
     if(!r.ok) throw new Error("frame "+i);
     return r.arrayBuffer();
   }).then(buf=>{
@@ -456,8 +624,35 @@ const ui = {
   mode:$("mode"), cmap:$("cmap"), autolvl:$("autolvl"), psize:$("psize"),
   atten:$("atten"), rings:$("rings"), play:$("play"), seek:$("seek"),
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
-  rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"),
+  rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
+  tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"),
 };
+
+// ---------- 会場メッシュ (起動時に一度だけ取得) ----------
+let venueVao=null, venueCount=0;
+fetch("/venue").then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf=>{
+  const dv=new DataView(buf);
+  const nv=dv.getUint32(4,true), nf=dv.getUint32(8,true);
+  let o=12;
+  const pos=new Float32Array(buf,o,nv*3); o+=nv*12;
+  const col=new Uint8Array(buf,o,nv*3);   o+=nv*3;
+  const idx=new Uint32Array(buf,o,nf*3);
+  venueVao=gl.createVertexArray(); gl.bindVertexArray(venueVao);
+  const mk=(loc,size,type,norm,data)=>{
+    const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+    gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,size,type,norm,0,0);
+  };
+  mk(0,3,gl.FLOAT,false,pos);
+  mk(1,3,gl.UNSIGNED_BYTE,true,col);
+  const ib=gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,idx,gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  venueCount=nf*3;
+  console.log(`venue mesh: ${nv} verts / ${nf} tris`);
+}).catch(()=>{ ui.venue.checked=false; console.log("venue mesh not available"); });
+const MAX_PX = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
 let playing=false, playhead=0, curFrame=-1, curData=null, lastT=0, levelDirty=true;
 
 function fmtTime(s){
@@ -470,6 +665,11 @@ function setPlaying(p){
 ui.play.onclick = ()=>setPlaying(!playing);
 ui.seek.oninput = ()=>{ playhead = +ui.seek.value; };
 ui.mode.onchange = ()=>{ levelDirty=true; levels.lo=0; levels.hi=1; };
+ui.tmed.onchange = ()=>{   // フィルタ枚数が変わると全フレームの内容が変わる
+  TMED = +ui.tmed.value;
+  cache.clear(); order.length=0; inflight.clear();
+  curFrame=-1; curData=null;
+};
 $("resetcam").onclick = resetCam;
 document.addEventListener("keydown",e=>{
   if(e.code==="Space"){ e.preventDefault(); setPlaying(!playing); }
@@ -520,6 +720,24 @@ function cmapJS(c, t){
   }
   return [t,t,t];
 }
+// 接線基底 (Duff et al. 2017) を phi だけ回す — GLSL onb() / server._onb と同一式
+function tangentAxes(nx,ny,nz, ph){
+  const s = nz>=0 ? 1 : -1, a = -1/(s+nz), b = nx*ny*a;
+  const t1=[1+s*nx*nx*a, s*b, -s*nx], t2=[b, s+ny*ny*a, -ny];
+  const c=Math.cos(ph), sn=Math.sin(ph);
+  return [[ c*t1[0]+sn*t2[0],  c*t1[1]+sn*t2[1],  c*t1[2]+sn*t2[2]],
+          [-sn*t1[0]+c*t2[0], -sn*t1[1]+c*t2[1], -sn*t1[2]+c*t2[2]]];
+}
+// 行優先の3x3回転行列 → 正規化クォータニオン (w,x,y,z)
+function matToQuat(m){
+  const tr=m[0]+m[4]+m[8]; let w,x,y,z,s;
+  if (tr>0){ s=Math.sqrt(tr+1)*2; w=0.25*s; x=(m[7]-m[5])/s; y=(m[2]-m[6])/s; z=(m[3]-m[1])/s; }
+  else if (m[0]>m[4] && m[0]>m[8]){ s=Math.sqrt(1+m[0]-m[4]-m[8])*2; w=(m[7]-m[5])/s; x=0.25*s; y=(m[1]+m[3])/s; z=(m[2]+m[6])/s; }
+  else if (m[4]>m[8]){ s=Math.sqrt(1+m[4]-m[0]-m[8])*2; w=(m[2]-m[6])/s; x=(m[1]+m[3])/s; y=0.25*s; z=(m[5]+m[7])/s; }
+  else { s=Math.sqrt(1+m[8]-m[0]-m[4])*2; w=(m[3]-m[1])/s; x=(m[2]+m[6])/s; y=(m[5]+m[7])/s; z=0.25*s; }
+  const l=Math.hypot(w,x,y,z)||1;
+  return [w/l,x/l,y/l,z/l];
+}
 function pointValue(fr, i, mode){
   if (mode===0) return fr.refl[i]/255;
   if (mode===1) return fr.sig[i]/65535;
@@ -554,17 +772,18 @@ $("gsply").onclick = ()=>{
     const nl=Math.hypot(nx,ny,nz)||1; nx/=nl; ny/=nl; nz/=nl;
     const t=(pointValue(fr,i,mode)-levels.lo)/Math.max(levels.hi-levels.lo,1e-6);
     const rgb=cmapJS(cmapId,t);
-    const r=0.004*Math.pow(1.0182,fr.rad[i])*radMul, sg=r*0.6;
-    // z軸を法線に合わせるクォータニオン (w,x,y,z)
-    let qw=1+nz, qx=-ny, qy=nx, qz=0;
-    if (qw<1e-6){ qw=0; qx=1; qy=0; qz=0; }
-    const ql=Math.hypot(qw,qx,qy,qz);
+    // 画面と同じ異方性楕円を書き出す (等方円盤だとGSツール側でも板に見える)
+    const s1=0.004*Math.pow(1.0182,fr.rad[i]) *radMul*0.75;
+    const s2=0.004*Math.pow(1.0182,fr.rad2[i])*radMul*0.75;
+    const [e1,e2]=tangentAxes(nx,ny,nz, fr.phi[i]/255*Math.PI);
+    // 局所軸(e1,e2,n)を列に持つ回転行列 → クォータニオン
+    const [qw,qx,qy,qz]=matToQuat([e1[0],e2[0],nx, e1[1],e2[1],ny, e1[2],e2[2],nz]);
     const put=v=>{dv.setFloat32(o,v,true);o+=4;};
     put(x);put(y);put(z); put(nx);put(ny);put(nz);
     put((rgb[0]-0.5)/SH0); put((rgb[1]-0.5)/SH0); put((rgb[2]-0.5)/SH0);
     put(opa);
-    put(Math.log(sg)); put(Math.log(sg)); put(Math.log(sg*0.15));
-    put(qw/ql); put(qx/ql); put(qy/ql); put(qz/ql);
+    put(Math.log(s1)); put(Math.log(s2)); put(Math.log(Math.min(s1,s2)*0.15));
+    put(qw); put(qx); put(qy); put(qz);
   });
   const a=document.createElement("a");
   a.href=URL.createObjectURL(new Blob([hb,body]));
@@ -621,6 +840,16 @@ function loop(tms){
   const proj = perspective(55*Math.PI/180, canvas.width/canvas.height, 0.05, 300);
   const {v:view} = viewMatrix();
 
+  if (venueVao && ui.venue.checked){
+    gl.useProgram(venueProg);
+    gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uProj"),false,proj);
+    gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uView"),false,view);
+    gl.uniform1f(gl.getUniformLocation(venueProg,"uDim"), +ui.vdim.value);
+    gl.bindVertexArray(venueVao);
+    gl.drawElements(gl.TRIANGLES, venueCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+  }
+
   if (ui.rings.checked){
     gl.useProgram(lineProg);
     gl.uniformMatrix4fv(gl.getUniformLocation(lineProg,"uProj"),false,proj);
@@ -633,8 +862,29 @@ function loop(tms){
   }
 
   if (curData && vao){
-    const splat = ui.rmode.value === "1";
-    if (splat){
+    const rmode = ui.rmode.value;
+    if (rmode === "2"){
+      if (meshFrame !== curFrame){ buildMeshIdx(curData); meshFrame = curFrame; }
+      updateTex(curData, +ui.mode.value);
+      gl.useProgram(meshProg);
+      const u=n=>gl.getUniformLocation(meshProg,n);
+      gl.uniformMatrix4fv(u("uProj"),false,proj);
+      gl.uniformMatrix4fv(u("uView"),false,view);
+      gl.uniform1i(u("uW"), INFO.cols); gl.uniform1i(u("uH"), INFO.rows);
+      gl.uniform1i(u("uCmap"), +ui.cmap.value);
+      gl.uniform1f(u("uShade"), +ui.shade.value);
+      const LW = [0.45, -0.38, 0.81];
+      gl.uniform3f(u("uLightDir"),
+        view[0]*LW[0]+view[4]*LW[1]+view[8]*LW[2],
+        view[1]*LW[0]+view[5]*LW[1]+view[9]*LW[2],
+        view[2]*LW[0]+view[6]*LW[1]+view[10]*LW[2]);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(u("uTex"), 0);
+      gl.bindVertexArray(meshVao);
+      gl.drawElements(gl.TRIANGLES, meshCount, gl.UNSIGNED_INT, 0);
+      gl.bindVertexArray(null);
+    } else if (rmode === "1"){
       if (needResort(curFrame)) sortSplats(curData, view);
       gl.useProgram(splatProg);
       const u=n=>gl.getUniformLocation(splatProg,n);
@@ -642,8 +892,16 @@ function loop(tms){
       gl.uniformMatrix4fv(u("uView"),false,view);
       gl.uniform1f(u("uRadMul"), +ui.radmul.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
+      gl.uniform1f(u("uShade"), +ui.shade.value);
+      // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
+      const LW = [0.45, -0.38, 0.81];
+      gl.uniform3f(u("uLightDir"),
+        view[0]*LW[0]+view[4]*LW[1]+view[8]*LW[2],
+        view[1]*LW[0]+view[5]*LW[1]+view[9]*LW[2],
+        view[2]*LW[0]+view[6]*LW[1]+view[10]*LW[2]);
       gl.uniform1f(u("uFocal"), proj[5]*canvas.height/2);
       gl.uniform1f(u("uDpr"), dpr);
+      gl.uniform1f(u("uMaxPx"), MAX_PX/dpr);
       gl.uniform2f(u("uVp"), canvas.width, canvas.height);
       gl.uniform2f(u("uPxy"), proj[0], proj[5]);
       gl.uniform1i(u("uMode"), +ui.mode.value);
