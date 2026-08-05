@@ -23,7 +23,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
@@ -546,6 +546,20 @@ def load_venue():
                      f.tobytes()])
 
 
+VIDEOS = {}              # name -> path (会場を撮った実写。射影テクスチャの素材)
+
+
+def find_videos():
+    d = os.path.dirname(DEFAULT_DIR)
+    if not os.path.isdir(d):
+        return
+    for fn in sorted(os.listdir(d)):
+        if fn.lower().endswith((".mp4", ".mov")):
+            VIDEOS[fn] = os.path.join(d, fn)
+    if VIDEOS:
+        print("Videos:", ", ".join(VIDEOS))
+
+
 def make_handler(src: OusterPcap):
     venue = load_venue()
     info = {
@@ -577,6 +591,40 @@ def make_handler(src: OusterPcap):
             self.end_headers()
             self.wfile.write(body)
 
+        # 動画は大きいのでRangeで部分送信する (シークに必須)
+        def _send_video(self, name):
+            path = VIDEOS.get(name)
+            if not path or not os.path.exists(path):
+                self._send(404, "text/plain", b"unknown video")
+                return
+            size = os.path.getsize(path)
+            rng = self.headers.get("Range")
+            start, end = 0, size - 1
+            if rng and rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                if a:
+                    start = int(a)
+                if b:
+                    end = min(int(b), size - 1)
+                end = min(end, start + 4 * 1024 * 1024 - 1)
+            length = max(0, end - start + 1)
+            self.send_response(206 if rng else 200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if rng:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                remain = length
+                while remain > 0:
+                    chunk = fh.read(min(262144, remain))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remain -= len(chunk)
+
         def do_GET(self):
             try:
                 if self.path in ("/", "/index.html"):
@@ -584,6 +632,11 @@ def make_handler(src: OusterPcap):
                         self._send(200, "text/html; charset=utf-8", fh.read())
                 elif self.path == "/info":
                     self._send(200, "application/json", info_json)
+                elif self.path == "/videos":
+                    self._send(200, "application/json",
+                               json.dumps(sorted(VIDEOS)).encode())
+                elif self.path.startswith("/video/"):
+                    self._send_video(unquote(os.path.basename(urlparse(self.path).path)))
                 elif self.path == "/venue":
                     if venue is None:
                         self._send(404, "text/plain", b"run bake_venue.py first")
@@ -629,6 +682,7 @@ def main():
         if not os.path.exists(p):
             raise SystemExit(f"{label} not found: {p}")
 
+    find_videos()
     src = OusterPcap(args.pcap, args.meta)
     print(f"{src.meta['sensor_info']['prod_line']}  "
           f"{src.n_frames} frames  {src.fps:.1f} fps  "

@@ -81,6 +81,9 @@
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
   <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="10"></div>
   <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.2"></div>
+  <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
+  <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="0"></div>
+  <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -197,7 +200,7 @@ in vec2 aNrm; in float aRad; in float aRad2; in float aPhi; in float aDyn;
 uniform mat4 uProj, uView;
 uniform float uLo, uHi, uRadMul, uFocal, uDpr, uMaxPx, uDynMin;
 uniform int uMode;
-out float vT; out vec3 vC; out vec3 vN; out vec3 vE1; out vec3 vE2; out vec2 vSig;
+out float vT; out vec3 vC; out vec3 vN; out vec3 vE1; out vec3 vE2; out vec2 vSig; out vec3 vW;
 vec3 octDecode(vec2 e){
   vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
   if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
@@ -223,7 +226,7 @@ void main(){
   float r1 = 0.004 * pow(1.0182, aRad *255.0) * uRadMul;
   float r2 = 0.004 * pow(1.0182, aRad2*255.0) * uRadMul;
   vSig = vec2(r1, r2) * 0.75;
-  vC = eye.xyz;
+  vC = eye.xyz; vW = aPos;
   vec3 n = octDecode(aNrm);
   vN = mat3(uView) * n;
   vec3 t1, t2; onb(n, t1, t2);
@@ -236,12 +239,23 @@ void main(){
   gl_PointSize = clamp(rpx*5.0, 2.0, uMaxPx) * uDpr;
 }`,`#version 300 es
 precision highp float;
-in float vT; in vec3 vC; in vec3 vN; in vec3 vE1; in vec3 vE2; in vec2 vSig;
+in float vT; in vec3 vC; in vec3 vN; in vec3 vE1; in vec3 vE2; in vec2 vSig; in vec3 vW;
 uniform vec2 uVp; uniform vec2 uPxy;
 uniform int uCmap; uniform float uOpacity; uniform float uShade;
 uniform vec3 uLightDir;
 out vec4 frag;
 ${CMAP_GLSL}
+uniform sampler2D uVid; uniform vec4 uP0, uP1, uP2; uniform float uVidOn;
+// 実写映像を3x4射影行列で貼る。範囲外や背面は元の色のまま残す。
+vec3 projectVideo(vec3 w, vec3 fallback){
+  if (uVidOn < 0.5) return fallback;
+  vec4 h = vec4(w, 1.0);
+  float d = dot(uP2, h);
+  if (d <= 0.0) return fallback;
+  vec2 uv = vec2(dot(uP0, h), dot(uP1, h)) / d;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return fallback;
+  return texture(uVid, uv).rgb;
+}
 void main(){
   vec2 ndc = (gl_FragCoord.xy / uVp) * 2.0 - 1.0;
   vec3 d = vec3(ndc.x/uPxy.x, ndc.y/uPxy.y, -1.0);
@@ -262,7 +276,7 @@ void main(){
   float x = dot(q, vE1), y = dot(q, vE2);
   float a = exp(-0.5 * ((x*x)/(vSig.x*vSig.x) + (y*y)/(vSig.y*vSig.y))) * uOpacity;
   if (a < 0.02) discard;
-  vec3 col = cmap(uCmap, clamp(vT,0.0,1.0));
+  vec3 col = projectVideo(vW, cmap(uCmap, clamp(vT,0.0,1.0)));
   if (uShade > 0.001){
     // 法線はセンサー方向に反転済みなので、視線ではなくワールド固定の平行光で陰影を付ける
     vec3 nn = normalize(vN);
@@ -282,7 +296,7 @@ precision highp float;
 in vec3 aPos; in vec2 aNrm; in float aDyn;
 uniform mat4 uProj, uView;
 uniform int uW, uH;
-out vec2 vUv; out vec3 vN; out vec3 vC; out float vDyn;
+out vec2 vUv; out vec3 vN; out vec3 vC; out float vDyn; out vec3 vW;
 vec3 octDecode(vec2 e){
   vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
   if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * vec2(v.x>=0.0?1.0:-1.0, v.y>=0.0?1.0:-1.0);
@@ -297,16 +311,29 @@ void main(){
   vN = mat3(uView) * octDecode(aNrm);
   vC = eye.xyz;
   vDyn = aDyn;
+  vW = aPos;
 }`,`#version 300 es
 precision highp float;
-in vec2 vUv; in vec3 vN; in vec3 vC; in float vDyn;
+in vec2 vUv; in vec3 vN; in vec3 vC; in float vDyn; in vec3 vW;
 uniform sampler2D uTex;
 uniform int uCmap; uniform float uShade; uniform vec3 uLightDir; uniform float uDynMin;
 out vec4 frag;
 ${CMAP_GLSL}
+uniform sampler2D uVid; uniform vec4 uP0, uP1, uP2; uniform float uVidOn;
+// 実写映像を3x4射影行列で貼る。範囲外や背面は元の色のまま残す。
+vec3 projectVideo(vec3 w, vec3 fallback){
+  if (uVidOn < 0.5) return fallback;
+  vec4 h = vec4(w, 1.0);
+  float d = dot(uP2, h);
+  if (d <= 0.0) return fallback;
+  vec2 uv = vec2(dot(uP0, h), dot(uP1, h)) / d;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return fallback;
+  return texture(uVid, uv).rgb;
+}
+
 void main(){
   if (vDyn < uDynMin) discard;
-  vec3 col = cmap(uCmap, texture(uTex, vUv).r);
+  vec3 col = projectVideo(vW, cmap(uCmap, texture(uTex, vUv).r));
   if (uShade > 0.001){
     vec3 nn = normalize(vN);
     float ndl = max(dot(nn, uLightDir), 0.0);
@@ -645,7 +672,7 @@ const ui = {
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
-  growm:$("growm"),
+  growm:$("growm"), vidon:$("vidon"), voff:$("voff"),
 };
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
@@ -813,6 +840,183 @@ $("gsply").onclick = ()=>{
   a.click(); URL.revokeObjectURL(a.href);
 };
 
+// ---------- 実写映像の射影テクスチャ ----------
+// M5(俯瞰カメラ)は固定なので、3x4の射影行列を一度求めれば全編で使える。
+// 内部/外部パラメータに分解する必要はない: 3D->画像UVの写像そのものが要る。
+let vidEl=null, vidTex=null, PMAT=null, calibPairs=[], pendingUV=null;
+
+function jacobiSmallestVec(M, n){          // 対称行列の最小固有値に対応する固有ベクトル
+  const a=M.map(r=>Float64Array.from(r));
+  const V=Array.from({length:n},(_,i)=>{const r=new Float64Array(n); r[i]=1; return r;});
+  for(let sweep=0; sweep<60; sweep++){
+    let off=0;
+    for(let p=0;p<n;p++) for(let q=p+1;q<n;q++) off+=a[p][q]*a[p][q];
+    if(off<1e-22) break;
+    for(let p=0;p<n;p++) for(let q=p+1;q<n;q++){
+      if(Math.abs(a[p][q])<1e-18) continue;
+      const th=(a[q][q]-a[p][p])/(2*a[p][q]);
+      const t=Math.sign(th||1)/(Math.abs(th)+Math.sqrt(th*th+1));
+      const c=1/Math.sqrt(t*t+1), s=t*c;
+      for(let k=0;k<n;k++){
+        const akp=a[k][p], akq=a[k][q];
+        a[k][p]=c*akp-s*akq; a[k][q]=s*akp+c*akq;
+      }
+      for(let k=0;k<n;k++){
+        const apk=a[p][k], aqk=a[q][k];
+        a[p][k]=c*apk-s*aqk; a[q][k]=s*apk+c*aqk;
+        const vkp=V[k][p], vkq=V[k][q];
+        V[k][p]=c*vkp-s*vkq; V[k][q]=s*vkp+c*vkq;
+      }
+    }
+  }
+  let best=0; for(let i=1;i<n;i++) if(a[i][i]<a[best][best]) best=i;
+  return V.map(r=>r[best]);
+}
+
+// 6組以上の対応から DLT で 3x4 射影行列を解く (Hartley正規化つき)
+function solveDLT(pairs){
+  const n=pairs.length; if(n<6) return null;
+  let cu=0,cv=0,cx=0,cy=0,cz=0;
+  for(const p of pairs){cu+=p.u;cv+=p.v;cx+=p.X;cy+=p.Y;cz+=p.Z;}
+  cu/=n;cv/=n;cx/=n;cy/=n;cz/=n;
+  let d2=0,d3=0;
+  for(const p of pairs){ d2+=Math.hypot(p.u-cu,p.v-cv); d3+=Math.hypot(p.X-cx,p.Y-cy,p.Z-cz); }
+  const su=Math.SQRT2/Math.max(d2/n,1e-9), sx=Math.sqrt(3)/Math.max(d3/n,1e-9);
+  const rows=[];
+  for(const p of pairs){
+    const u=(p.u-cu)*su, v=(p.v-cv)*su;
+    const X=(p.X-cx)*sx, Y=(p.Y-cy)*sx, Z=(p.Z-cz)*sx;
+    rows.push([X,Y,Z,1,0,0,0,0,-u*X,-u*Y,-u*Z,-u]);
+    rows.push([0,0,0,0,X,Y,Z,1,-v*X,-v*Y,-v*Z,-v]);
+  }
+  const M=Array.from({length:12},()=>new Float64Array(12));
+  for(const r of rows) for(let i=0;i<12;i++) for(let j=0;j<12;j++) M[i][j]+=r[i]*r[j];
+  const p=jacobiSmallestVec(M,12);
+  const Pn=[[p[0],p[1],p[2],p[3]],[p[4],p[5],p[6],p[7]],[p[8],p[9],p[10],p[11]]];
+  // 逆正規化: P = T2^-1 * Pn * T3
+  const T2i=[[1/su,0,cu],[0,1/su,cv],[0,0,1]];
+  const T3=[[sx,0,0,-sx*cx],[0,sx,0,-sx*cy],[0,0,sx,-sx*cz],[0,0,0,1]];
+  const A=[[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+  for(let i=0;i<3;i++) for(let j=0;j<4;j++){ let s=0; for(let k=0;k<3;k++) s+=T2i[i][k]*Pn[k][j]; A[i][j]=s; }
+  const P=[[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+  for(let i=0;i<3;i++) for(let j=0;j<4;j++){ let s=0; for(let k=0;k<4;k++) s+=A[i][k]*T3[k][j]; P[i][j]=s; }
+  return P;
+}
+
+function projectWith(P, X, Y, Z){
+  const w=P[2][0]*X+P[2][1]*Y+P[2][2]*Z+P[2][3];
+  return [(P[0][0]*X+P[0][1]*Y+P[0][2]*Z+P[0][3])/w,
+          (P[1][0]*X+P[1][1]*Y+P[1][2]*Z+P[1][3])/w, w];
+}
+function calibResidual(P, pairs){
+  let s=0; for(const p of pairs){ const q=projectWith(P,p.X,p.Y,p.Z); s+=Math.hypot(q[0]-p.u,q[1]-p.v); }
+  return s/pairs.length;
+}
+
+
+// 映像テクスチャと較正UI
+function setupVideo(){
+  vidEl = document.createElement("video");
+  vidEl.src = "/video/honsen%20M5.mp4";     // 固定カメラなので一度の較正で全編に使える
+  vidEl.muted = true; vidEl.playsInline = true; vidEl.preload = "auto";
+  vidTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, vidTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,1,1,0,gl.RGB,gl.UNSIGNED_BYTE,new Uint8Array([40,40,50]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  const saved = localStorage.getItem("pmat");
+  if (saved) { try { PMAT = JSON.parse(saved); } catch(e){} }
+}
+function syncVideo(){
+  if (!vidEl || !INFO) return;
+  const want = playhead/INFO.fps + (+ui.voff.value);
+  if (vidEl.readyState >= 2 && Math.abs(vidEl.currentTime - want) > 0.15)
+    vidEl.currentTime = Math.max(0, Math.min(vidEl.duration||0, want));
+  if (vidEl.readyState >= 2){
+    gl.bindTexture(gl.TEXTURE_2D, vidTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,vidEl);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+}
+function setProjUniforms(prog, unit){
+  const u=n=>gl.getUniformLocation(prog,n);
+  const on = (ui.vidon.checked && PMAT) ? 1 : 0;
+  gl.uniform1f(u("uVidOn"), on);
+  if (on){
+    gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, vidTex);
+    gl.uniform1i(u("uVid"), unit);
+    gl.uniform4f(u("uP0"), PMAT[0][0],PMAT[0][1],PMAT[0][2],PMAT[0][3]);
+    gl.uniform4f(u("uP1"), PMAT[1][0],PMAT[1][1],PMAT[1][2],PMAT[1][3]);
+    gl.uniform4f(u("uP2"), PMAT[2][0],PMAT[2][1],PMAT[2][2],PMAT[2][3]);
+  }
+}
+// クリックされた画面位置に最も近い点を拾う
+function pickPoint(px, py){
+  if (!curData) return null;
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  const {v:view} = viewMatrix();
+  const proj = perspective(55*Math.PI/180, canvas.width/canvas.height, 0.05, 300);
+  const p=curData.pos, n=curData.n;
+  let best=-1, bd=14*14;
+  for(let i=0;i<n;i++){
+    const X=p[i*3],Y=p[i*3+1],Z=p[i*3+2];
+    if(X===0&&Y===0&&Z===0) continue;
+    const ex=view[0]*X+view[4]*Y+view[8]*Z+view[12];
+    const ey=view[1]*X+view[5]*Y+view[9]*Z+view[13];
+    const ez=view[2]*X+view[6]*Y+view[10]*Z+view[14];
+    if(ez>-0.05) continue;
+    const cw=-ez;
+    const sx=(proj[0]*ex/cw*0.5+0.5)*canvas.width/dpr;
+    const sy=(1-(proj[5]*ey/cw*0.5+0.5))*canvas.height/dpr;
+    const d=(sx-px)*(sx-px)+(sy-py)*(sy-py);
+    if(d<bd){ bd=d; best=i; }
+  }
+  return best<0 ? null : {X:p[best*3], Y:p[best*3+1], Z:p[best*3+2]};
+}
+function openCalib(){
+  const box=document.createElement("div");
+  box.id="calibbox";
+  box.style.cssText="position:absolute;right:8px;top:8px;width:min(52vw,760px);"+
+    "background:rgba(12,14,20,.95);border:1px solid #3a4058;border-radius:10px;padding:10px;z-index:50";
+  box.innerHTML='<div style="margin-bottom:6px">① 映像上の点をクリック → ② 3D側の同じ点をクリック（6組以上）'+
+    '<span id="cst" style="float:right;color:#ffb37a"></span></div>';
+  const vv=document.createElement("video");
+  vv.src=vidEl.src; vv.muted=true; vv.controls=true; vv.style.cssText="width:100%;display:block;cursor:crosshair";
+  box.appendChild(vv);
+  const bar=document.createElement("div"); bar.style.cssText="margin-top:6px;display:flex;gap:8px";
+  bar.innerHTML='<button id="csolve">Solve</button><button id="cundo">Undo</button>'+
+    '<button id="cclear">Clear</button><button id="cclose">Close</button>';
+  box.appendChild(bar); document.body.appendChild(box);
+  const st=()=>{ $("cst").textContent = `${calibPairs.length} 組` +
+      (pendingUV? " / 映像側を取得済み→3Dをクリック":"") +
+      (PMAT? `  残差 ${(calibResidual(PMAT,calibPairs)*1920).toFixed(1)} px`:""); };
+  vv.addEventListener("click", e=>{
+    const r=vv.getBoundingClientRect();
+    pendingUV={u:(e.clientX-r.left)/r.width, v:(e.clientY-r.top)/r.height};
+    st();
+  });
+  $("csolve").onclick=()=>{ const P=solveDLT(calibPairs);
+    if(!P){ alert("6組以上必要です"); return; }
+    PMAT=P; localStorage.setItem("pmat",JSON.stringify(P)); ui.vidon.checked=true; st(); };
+  $("cundo").onclick=()=>{ calibPairs.pop(); st(); };
+  $("cclear").onclick=()=>{ calibPairs.length=0; pendingUV=null; PMAT=null;
+    localStorage.removeItem("pmat"); st(); };
+  $("cclose").onclick=()=>{ box.remove(); };
+  window.calibStatus=st; st();
+}
+canvas.addEventListener("click", e=>{
+  if(!pendingUV || !$("calibbox")) return;
+  const r=canvas.getBoundingClientRect();
+  const hit=pickPoint(e.clientX-r.left, e.clientY-r.top);
+  if(!hit){ return; }
+  calibPairs.push({...pendingUV, ...hit}); pendingUV=null;
+  if(window.calibStatus) window.calibStatus();
+});
+$("calib").onclick = ()=>{ if(!$("calibbox")) openCalib(); };
+
 // ---------- メインループ ----------
 function resize(){
   const dpr = Math.min(window.devicePixelRatio||1, 2);
@@ -853,6 +1057,7 @@ function loop(tms){
     getFrame(want).catch(()=>{});
   }
 
+  if (ui.vidon.checked) syncVideo();
   const dpr = resize();
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.clearColor(0.012,0.012,0.02,1);
@@ -904,6 +1109,7 @@ function loop(tms){
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.uniform1i(u("uTex"), 0);
+      setProjUniforms(meshProg, 1);
       gl.bindVertexArray(meshVao);
       gl.drawElements(gl.TRIANGLES, meshCount, gl.UNSIGNED_INT, 0);
       gl.bindVertexArray(null);
@@ -917,6 +1123,7 @@ function loop(tms){
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
       gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
+      setProjUniforms(splatProg, 1);
       // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
@@ -974,6 +1181,7 @@ fetch("/info").then(r=>r.json()).then(info=>{
                          `${info.fps.toFixed(1)}fps`;
   ui.seek.max = info.n_frames-1;
   initBuffers(info.n_points);
+  setupVideo();
   getFrame(0).then(()=>{ setPlaying(true); });
   requestAnimationFrame(loop);
 });
