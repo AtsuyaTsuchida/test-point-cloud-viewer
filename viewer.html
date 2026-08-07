@@ -84,6 +84,14 @@
   <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
   <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="0"></div>
   <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
+  <div class="row"><label>Record</label>
+    <select id="reclen">
+      <option value="10">10 s</option>
+      <option value="30" selected>30 s</option>
+      <option value="60">60 s</option>
+      <option value="0">全編</option>
+    </select></div>
+  <div class="row"><button id="recbtn" style="width:100%">● Record 1080p</button></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -673,6 +681,7 @@ const ui = {
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"),
+  reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
@@ -1018,7 +1027,14 @@ canvas.addEventListener("click", e=>{
 $("calib").onclick = ()=>{ if(!$("calibbox")) openCalib(); };
 
 // ---------- メインループ ----------
+let RECSIZE = null;
 function resize(){
+  if (RECSIZE){
+    if (canvas.width!==RECSIZE[0]||canvas.height!==RECSIZE[1]){
+      canvas.width=RECSIZE[0]; canvas.height=RECSIZE[1];
+    }
+    return 1;
+  }
   const dpr = Math.min(window.devicePixelRatio||1, 2);
   const w = Math.round(canvas.clientWidth*dpr), h = Math.round(canvas.clientHeight*dpr);
   if(canvas.width!==w||canvas.height!==h){ canvas.width=w; canvas.height=h; }
@@ -1172,6 +1188,58 @@ function loop(tms){
     `Frame ${want+1}/${INFO.n_frames} · ${INFO.n_points.toLocaleString()} pts · `+
     `cached ${cache.size}`;
 }
+
+
+// ---------- 録画 ----------
+// フレームを requestFrame() で明示的に送る。デコードを待ってから1枚ずつ出すので
+// 取りこぼしが起きず、実時間より遅くても出力は等間隔になる。
+let recording = false;
+async function recordClip(seconds, fps){
+  if (recording || !INFO) return;
+  recording = true;
+  const btn = ui.recbtn, label = btn.textContent;
+  RECSIZE = [1920, 1080];
+  const stream = canvas.captureStream(0);
+  const track = stream.getVideoTracks()[0];
+  const mime = ["video/mp4;codecs=avc1.42E01E", "video/webm;codecs=vp9", "video/webm"]
+    .find(t => MediaRecorder.isTypeSupported(t)) || "";
+  const rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 16e6});
+  const chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.start();
+
+  const start = Math.floor(playhead);
+  const step = INFO.fps / fps;
+  const total = seconds > 0 ? Math.round(seconds * fps)
+                            : Math.floor((INFO.n_frames - start) / step);
+  setPlaying(false);
+  try {
+    for (let k = 0; k < total; k++){
+      const idx = Math.min(INFO.n_frames - 1, Math.floor(start + k * step));
+      const fr = await getFrame(idx);
+      playhead = idx; curData = fr; curFrame = idx; upload(fr); meshFrame = -1;
+      if (ui.autolvl.checked) computeLevels(fr, +ui.mode.value);
+      if (ui.vidon.checked) syncVideo();
+      loop(performance.now());
+      track.requestFrame();
+      if (k % 10 === 0) btn.textContent = `■ ${k}/${total}`;
+      await new Promise(r => setTimeout(r, 0));
+    }
+  } finally {
+    rec.stop();
+    await new Promise(r => { rec.onstop = r; });
+    RECSIZE = null; recording = false; btn.textContent = label;
+  }
+  const ext = mime.startsWith("video/mp4") ? "mp4" : "webm";
+  const blob = new Blob(chunks, {type: mime || "video/webm"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `pointcloud_${String(start).padStart(5,"0")}.${ext}`;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 10000);
+  return {bytes: blob.size, frames: total, type: mime};
+}
+$("recbtn").onclick = ()=> recordClip(+ui.reclen.value, 20);
 
 // ---------- 起動 ----------
 fetch("/info").then(r=>r.json()).then(info=>{
