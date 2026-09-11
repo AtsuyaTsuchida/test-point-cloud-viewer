@@ -558,30 +558,75 @@ def venue_distance_cm(pts):
 VENUE_POINTS = None      # 会場を点群で描くモード用のバイナリ (ガウシアン中心 + 色)
 
 
-def load_venue():
-    """bake_venue.py が焼いた会場メッシュ (LiDAR座標系, 頂点カラー付き)。"""
-    global VENUE_DIST, VENUE_POINTS
+ERASE_PATH = os.path.join(HERE, "venue_erase.json")
+ERASE_LOCK = threading.Lock()
+VENUE_MESH = None        # 消去適用後の会場メッシュのバイナリ
+
+
+def load_erase():
+    """会場スキャンに写り込んだ撮影機材などを消すための領域。
+       boxes: {min:[x,y,z], max:[x,y,z]} の直方体
+       rules: {"x":[lo,hi], "z":[lo,hi], "abs_y_lt":v} の条件 (空中の細長い物用)"""
+    if os.path.exists(ERASE_PATH):
+        try:
+            with open(ERASE_PATH) as fh:
+                return json.load(fh)
+        except Exception as e:
+            print("venue_erase.json unreadable:", e)
+    return {"boxes": [], "rules": []}
+
+
+def erase_mask(P, cfg):
+    """消す点に True。"""
+    m = np.zeros(len(P), bool)
+    for b in cfg.get("boxes", []):
+        lo = np.asarray(b["min"], float); hi = np.asarray(b["max"], float)
+        m |= np.all((P >= lo) & (P <= hi), axis=1)
+    for r in cfg.get("rules", []):
+        k = np.ones(len(P), bool)
+        if "x" in r: k &= (P[:, 0] >= r["x"][0]) & (P[:, 0] <= r["x"][1])
+        if "y" in r: k &= (P[:, 1] >= r["y"][0]) & (P[:, 1] <= r["y"][1])
+        if "z" in r: k &= (P[:, 2] >= r["z"][0]) & (P[:, 2] <= r["z"][1])
+        if "abs_y_lt" in r: k &= np.abs(P[:, 1]) < r["abs_y_lt"]
+        m |= k
+    return m
+
+
+def build_venue():
+    """venue.npz と消去設定から、配信用の会場メッシュ/点群バイナリを作る。"""
+    global VENUE_DIST, VENUE_POINTS, VENUE_MESH
     p = os.path.join(HERE, "venue.npz")
     if not os.path.exists(p):
         return None
     z = np.load(p)
-    if "dist" in z:
+    cfg = load_erase()
+    if "dist" in z and VENUE_DIST is None:
         VENUE_DIST = (z["dist"], z["dist_origin"].astype(np.float64),
                       float(z["dist_cell"]))
         print(f"Venue distance grid: {z['dist'].shape} @"
               f"{float(z['dist_cell'])*100:.0f}cm")
     if "gs_pos" in z:
-        gp = np.ascontiguousarray(z["gs_pos"].astype(np.float32)); gc = np.ascontiguousarray(z["gs_rgb"])
+        gp = z["gs_pos"].astype(np.float32); gc = z["gs_rgb"]
+        keep = ~erase_mask(gp.astype(np.float64), cfg)
+        gp = np.ascontiguousarray(gp[keep]); gc = np.ascontiguousarray(gc[keep])
         VENUE_POINTS = b"".join([struct.pack("<4sI", b"VPT1", len(gp)), gp.tobytes(), gc.tobytes()])
-        print(f"Venue points: {len(gp)}")
+        print(f"Venue points: {len(gp)} (erased {int((~keep).sum())})")
     v = z["verts"].astype(np.float32)
     c = np.clip(z["colors"] * 255.0, 0, 255).astype(np.uint8)
     f = z["faces"].astype(np.uint32)
+    kill = erase_mask(v.astype(np.float64), cfg)
+    if kill.any():
+        f = f[~np.any(kill[f], axis=1)]          # 消す頂点に触れる面を落とす
     print(f"Venue mesh: {len(v)} verts / {len(f)} tris "
-          f"(yaw {float(z['yaw_deg']):.2f} deg)")
-    return b"".join([struct.pack("<4sII", b"VNU1", len(v), len(f)),
-                     v.tobytes(), np.ascontiguousarray(c).tobytes(),
-                     f.tobytes()])
+          f"(yaw {float(z['yaw_deg']):.2f} deg, erased verts {int(kill.sum())})")
+    VENUE_MESH = b"".join([struct.pack("<4sII", b"VNU1", len(v), len(f)),
+                           v.tobytes(), np.ascontiguousarray(c).tobytes(),
+                           f.tobytes()])
+    return VENUE_MESH
+
+
+def load_venue():
+    return build_venue()
 
 
 VIDEOS = {}              # name -> path (会場を撮った実写。射影テクスチャの素材)
@@ -673,7 +718,27 @@ def make_handler(src: OusterPcap):
                 u = urlparse(self.path)
                 n = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(n)
-                if u.path == "/calib/save":
+                if u.path == "/erase/add":
+                    d = json.loads(body.decode("utf-8"))
+                    with ERASE_LOCK:
+                        cfg = load_erase(); cfg.setdefault("boxes", []).append({"min": d["min"], "max": d["max"]})
+                        with open(ERASE_PATH, "w") as fh: json.dump(cfg, fh, indent=1)
+                        build_venue()
+                    self._send(200, "application/json", json.dumps({"boxes": len(cfg["boxes"])}).encode())
+                elif u.path == "/erase/undo":
+                    with ERASE_LOCK:
+                        cfg = load_erase()
+                        if cfg.get("boxes"): cfg["boxes"].pop()
+                        with open(ERASE_PATH, "w") as fh: json.dump(cfg, fh, indent=1)
+                        build_venue()
+                    self._send(200, "application/json", json.dumps({"boxes": len(cfg.get("boxes", []))}).encode())
+                elif u.path == "/erase/clear":
+                    with ERASE_LOCK:
+                        cfg = load_erase(); cfg["boxes"] = []
+                        with open(ERASE_PATH, "w") as fh: json.dump(cfg, fh, indent=1)
+                        build_venue()
+                    self._send(200, "application/json", b'{"boxes":0}')
+                elif u.path == "/calib/save":
                     d = json.loads(body.decode("utf-8"))
                     if not (isinstance(d.get("P"), list) and len(d["P"]) == 3):
                         raise ValueError("bad P")
@@ -710,16 +775,18 @@ def make_handler(src: OusterPcap):
                                json.dumps(sorted(VIDEOS)).encode())
                 elif self.path.startswith("/video/"):
                     self._send_video(unquote(os.path.basename(urlparse(self.path).path)))
+                elif urlparse(self.path).path == "/erase":
+                    self._send(200, "application/json", json.dumps(load_erase()).encode())
                 elif urlparse(self.path).path == "/venue_points":
                     if VENUE_POINTS is None:
                         self._send(404, "text/plain", b"run bake_venue.py first")
                     else:
                         self._send(200, "application/octet-stream", VENUE_POINTS, cache=True)
                 elif urlparse(self.path).path == "/venue":
-                    if venue is None:
+                    if VENUE_MESH is None:
                         self._send(404, "text/plain", b"run bake_venue.py first")
                     else:
-                        self._send(200, "application/octet-stream", venue,
+                        self._send(200, "application/octet-stream", VENUE_MESH,
                                    cache=True)
                 elif self.path.startswith("/frame/"):
                     u = urlparse(self.path)
