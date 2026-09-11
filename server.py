@@ -647,6 +647,39 @@ VIDEOS = {}              # name -> path (会場を撮った実写。射影テク
 CALIB_DIR = os.path.join(HERE, "calib_data")   # ブラウザから受けた較正素材の置き場
 
 
+AUDIO_ENV = {}           # name -> (rate, float32 env)  音量エンベロープのキャッシュ
+
+
+def audio_envelope(name, rate=50):
+    """動画の音声から音量エンベロープ(RMS, 0..1)を作る。計算は一度だけ。
+       アタックは速く、リリースは遅くして拍が形として残るようにする。"""
+    if name in AUDIO_ENV:
+        return AUDIO_ENV[name]
+    cache = os.path.join(CALIB_DIR, "audio_env_" + os.path.splitext(name)[0].replace(" ", "_") + ".npy")
+    if os.path.exists(cache):
+        env = np.load(cache).astype(np.float32)
+        AUDIO_ENV[name] = (rate, env); return AUDIO_ENV[name]
+    import av
+    c = av.open(VIDEOS[name]); st = c.streams.audio[0]; sr = st.rate
+    chunks = []
+    for fr in c.decode(st):
+        a = fr.to_ndarray()
+        if a.dtype.kind in "iu":
+            a = a.astype(np.float32) / np.iinfo(a.dtype).max
+        chunks.append(a.mean(0).astype(np.float32))
+    mono = np.concatenate(chunks); hop = sr // rate; win = hop * 2; N = len(mono) // hop
+    env = np.sqrt(np.array([(mono[i * hop:i * hop + win] ** 2).mean() for i in range(N)]))
+    env = np.minimum(env / max(np.percentile(env, 97), 1e-9), 1.0)
+    sm = np.empty_like(env); cur = 0.0
+    for i, x in enumerate(env):
+        cur = x if x > cur else cur * 0.85 + x * 0.15
+        sm[i] = cur
+    env = sm.astype(np.float32)
+    os.makedirs(CALIB_DIR, exist_ok=True); np.save(cache, env)
+    AUDIO_ENV[name] = (rate, env)
+    return AUDIO_ENV[name]
+
+
 def find_videos():
     d = os.path.dirname(DEFAULT_DIR)
     if not os.path.isdir(d):
@@ -784,6 +817,15 @@ def make_handler(src: OusterPcap):
                             self._send(200, "application/json", fh.read())
                     else:
                         self._send(404, "text/plain", b"no calibration yet")
+                elif urlparse(self.path).path == "/audio_env":
+                    name = unquote(parse_qs(urlparse(self.path).query).get("name", ["honsen M5.mp4"])[0])
+                    if name not in VIDEOS:
+                        self._send(404, "text/plain", b"unknown video")
+                    else:
+                        rate, env = audio_envelope(name)
+                        self._send(200, "application/octet-stream",
+                                   struct.pack("<fI", float(rate), len(env)) + env.astype("<f4").tobytes(),
+                                   cache=True)
                 elif self.path == "/videos":
                     self._send(200, "application/json",
                                json.dumps(sorted(VIDEOS)).encode())

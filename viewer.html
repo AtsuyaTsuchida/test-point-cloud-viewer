@@ -149,6 +149,9 @@
   <div class="row"><label>Blur (all)</label><input type="range" id="blurall" min="0" max="1" step="0.05" value="0"></div>
   <div class="row"><label>Bloom</label><input type="range" id="bloom" min="0" max="2" step="0.05" value="0"></div>
   <div class="row"><label>Vignette</label><input type="range" id="vig" min="0" max="1" step="0.05" value="0"></div>
+  <div class="row"><label>Sound wave</label><input type="checkbox" id="wave"></div>
+  <div class="row"><label>Wave speed m/s</label><input type="range" id="wavev" min="1" max="30" step="0.5" value="6"></div>
+  <div class="row"><label>Wave height m</label><input type="range" id="wavea" min="0" max="0.8" step="0.02" value="0.25"></div>
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
   </details>
 
@@ -428,8 +431,23 @@ precision highp float;
 in vec3 aPos; in vec3 aCol;
 uniform mat4 uProj, uView;
 out vec3 vCol; out vec3 vC;
+uniform sampler2D uEnv; uniform float uWaveOn, uWaveT, uWaveV, uWaveA, uWaveX0, uEnvRate, uEnvN;
+// 舞台前縁(x=uWaveX0)で時刻tに鳴った音が、客席奥(-x)へ速さvで進む。
+// 距離dの点には t - d/v の音量が届いていて、床と座席をその分だけ持ち上げる。
+float waveLift(vec3 p){
+  if (uWaveOn < 0.5 || p.x > uWaveX0 || p.z > 1.4) return 0.0;
+  float d = uWaveX0 - p.x;
+  float ts = uWaveT - d / uWaveV;
+  if (ts < 0.0) return 0.0;
+  float i = clamp(ts * uEnvRate, 0.0, uEnvN - 1.0);
+  vec2 uv = vec2((mod(i, 4096.0) + 0.5) / 4096.0, (floor(i / 4096.0) + 0.5) / ceil(uEnvN / 4096.0));
+  float e = texture(uEnv, uv).r;
+  return uWaveA * e * e;            // 二乗で山を尖らせる
+}
+
 void main(){
-  vec4 eye = uView * vec4(aPos,1.0);
+  vec3 p = aPos; p.z += waveLift(aPos);
+  vec4 eye = uView * vec4(p,1.0);
   gl_Position = uProj * eye;
   vCol = aCol; vC = eye.xyz;
 }`,`#version 300 es
@@ -451,8 +469,23 @@ precision highp float;
 in vec3 aPos; in vec3 aCol;
 uniform mat4 uProj, uView; uniform float uSize, uDpr;
 out vec3 vCol;
+uniform sampler2D uEnv; uniform float uWaveOn, uWaveT, uWaveV, uWaveA, uWaveX0, uEnvRate, uEnvN;
+// 舞台前縁(x=uWaveX0)で時刻tに鳴った音が、客席奥(-x)へ速さvで進む。
+// 距離dの点には t - d/v の音量が届いていて、床と座席をその分だけ持ち上げる。
+float waveLift(vec3 p){
+  if (uWaveOn < 0.5 || p.x > uWaveX0 || p.z > 1.4) return 0.0;
+  float d = uWaveX0 - p.x;
+  float ts = uWaveT - d / uWaveV;
+  if (ts < 0.0) return 0.0;
+  float i = clamp(ts * uEnvRate, 0.0, uEnvN - 1.0);
+  vec2 uv = vec2((mod(i, 4096.0) + 0.5) / 4096.0, (floor(i / 4096.0) + 0.5) / ceil(uEnvN / 4096.0));
+  float e = texture(uEnv, uv).r;
+  return uWaveA * e * e;            // 二乗で山を尖らせる
+}
+
 void main(){
-  vec4 eye = uView * vec4(aPos,1.0);
+  vec3 p = aPos; p.z += waveLift(aPos);
+  vec4 eye = uView * vec4(p,1.0);
   gl_Position = uProj * eye;
   gl_PointSize = clamp(uSize * 6.0 / max(-eye.z, 0.8), 1.0, 24.0) * uDpr;
   vCol = aCol;
@@ -892,7 +925,7 @@ const ui = {
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
   scolor:$("scolor"), bright:$("bright"),
-  dof:$("dof"), focustgt:$("focustgt"), erase:$("erase"), esize:$("esize"), ecount:$("ecount"), clipon:$("clipon"), bxmin:$("bxmin"), bxmax:$("bxmax"), bymin:$("bymin"), bymax:$("bymax"), focus:$("focus"), frange:$("frange"), blurall:$("blurall"), bloom:$("bloom"), vig:$("vig"),
+  dof:$("dof"), focustgt:$("focustgt"), wave:$("wave"), wavev:$("wavev"), wavea:$("wavea"), erase:$("erase"), esize:$("esize"), ecount:$("ecount"), clipon:$("clipon"), bxmin:$("bxmin"), bxmax:$("bxmax"), bymin:$("bymin"), bymax:$("bymax"), focus:$("focus"), frange:$("frange"), blurall:$("blurall"), bloom:$("bloom"), vig:$("vig"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -1311,6 +1344,37 @@ canvas.addEventListener("click", e=>{
 });
 $("calib").onclick = ()=>{ if(!$("calibbox")) openCalib(); };
 
+// ---------- 音の波: 音量エンベロープをテクスチャにして頂点シェーダで参照 ----------
+let ENV=null, ENV_RATE=50, envTex=null, envLoading=false;
+function loadEnvelope(){
+  if (ENV || envLoading) return; envLoading=true;
+  fetch("/audio_env?name=honsen%20M5.mp4").then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf=>{
+    const dv=new DataView(buf); ENV_RATE=dv.getFloat32(0,true); const n=dv.getUint32(4,true);
+    ENV=new Float32Array(buf,8,n);
+    const W=4096, H=Math.ceil(n/W); const u8=new Uint8Array(W*H);
+    for(let i=0;i<n;i++) u8[i]=Math.round(ENV[i]*255);
+    envTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,envTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,W,H,0,gl.RED,gl.UNSIGNED_BYTE,u8);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D,null); envLoading=false;
+    console.log(`audio envelope: ${n} samples @ ${ENV_RATE} Hz`);
+  }).catch(()=>{ envLoading=false; });
+}
+function setWaveUniforms(prog, unit){
+  const u=n=>gl.getUniformLocation(prog,n);
+  const on = ui.wave.checked && envTex && INFO;
+  gl.uniform1f(u("uWaveOn"), on?1:0);
+  if(!on) return;
+  gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, envTex); gl.uniform1i(u("uEnv"), unit);
+  gl.uniform1f(u("uWaveT"), playhead/INFO.fps + (+ui.voff.value));   // 映像=音声の時刻
+  gl.uniform1f(u("uWaveV"), +ui.wavev.value); gl.uniform1f(u("uWaveA"), +ui.wavea.value);
+  gl.uniform1f(u("uWaveX0"), +ui.bxmin.value);                          // 舞台前縁 = 舞台矩形の客席側境界
+  gl.uniform1f(u("uEnvRate"), ENV_RATE); gl.uniform1f(u("uEnvN"), ENV.length);
+}
+ui.wave.addEventListener("change", ()=>{ if(ui.wave.checked) loadEnvelope(); });
+
 // ---------- パネル: 文脈に応じて無関係な行を隠す / 開閉を記憶 ----------
 function rowOf(id){ const el=$(id); return el ? el.closest(".row") : null; }
 function showRow(id, on){ const r=rowOf(id); if(r) r.hidden=!on; }
@@ -1324,9 +1388,10 @@ function syncPanel(){
   showRow("vdim", ui.venuemode.value!=="off");
   showRow("esize", ui.erase.checked); showRow("eundo", ui.erase.checked);
   showRow("focustgt", ui.dof.checked); showRow("focus", ui.dof.checked && !ui.focustgt.checked); showRow("frange", ui.dof.checked);
-  showRow("voff", ui.vidon.checked); showRow("calib", ui.vidon.checked);
+  showRow("voff", ui.vidon.checked || ui.wave.checked); showRow("calib", ui.vidon.checked);
+  showRow("wavev", ui.wave.checked); showRow("wavea", ui.wave.checked);
 }
-for (const id of ["scolor","rmode","venuemode","clipon","erase","dof","focustgt","vidon","scene"])
+for (const id of ["scolor","rmode","venuemode","clipon","erase","dof","focustgt","vidon","scene","wave"])
   $(id).addEventListener("change", ()=>setTimeout(syncPanel,0));
 for (const d of document.querySelectorAll("#panel details")){
   const key="panel."+d.dataset.sec;
@@ -1400,6 +1465,7 @@ function loop(tms){
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDpr"), dpr);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDim"), +ui.vdim.value);
     gl.uniform1i(gl.getUniformLocation(vptProg,"uTint"), TINT);
+    setWaveUniforms(vptProg, 2);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uBright"), +ui.bright.value);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uOpacity"), +ui.opac.value);
     if (+ui.opac.value < 1){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); }
@@ -1413,6 +1479,7 @@ function loop(tms){
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uView"),false,view);
     gl.uniform1f(gl.getUniformLocation(venueProg,"uDim"), +ui.vdim.value);
     gl.uniform1i(gl.getUniformLocation(venueProg,"uTint"), TINT);
+    setWaveUniforms(venueProg, 2);
     gl.bindVertexArray(venueVao);
     gl.drawElements(gl.TRIANGLES, venueCount, gl.UNSIGNED_INT, 0);
     gl.bindVertexArray(null);
