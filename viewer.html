@@ -118,6 +118,9 @@
       <option value="0">全編</option>
     </select></div>
   <div class="row"><button id="recbtn" style="width:100%">● Record 1080p</button></div>
+  <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Clip audience side</label><input type="checkbox" id="clipon" checked></div>
+  <div class="row"><label>Clip axis deg</label><input type="range" id="clipdeg" min="0" max="360" step="5" value="180"></div>
+  <div class="row"><label>Clip beyond m</label><input type="range" id="clipd" min="-3" max="8" step="0.1" value="1.4"></div>
   <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Depth of field</label><input type="checkbox" id="dof"></div>
   <div class="row"><label>Focus at target</label><input type="checkbox" id="focustgt" checked></div>
   <div class="row"><label>Focus dist m</label><input type="range" id="focus" min="0.5" max="30" step="0.1" value="8"></div>
@@ -213,10 +216,11 @@ precision highp float;
 in vec3 aPos; in float aRefl; in float aSig; in float aNir; in float aDyn;
 uniform mat4 uProj, uView;
 uniform float uPointSize, uLo, uHi, uAtten, uDpr, uDynMin;
+uniform vec3 uClipN; uniform float uClipD;
 uniform int uMode;
 out float vT;
 void main(){
-  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; return; }
+  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin || dot(aPos,uClipN) > uClipD){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; return; }
   vec4 eye = uView * vec4(aPos,1.0);
   gl_Position = uProj * eye;
   float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
@@ -242,6 +246,7 @@ in vec3 aPos; in float aRefl; in float aSig; in float aNir;
 in vec2 aNrm; in float aRad; in float aRad2; in float aPhi; in float aDyn;
 uniform mat4 uProj, uView;
 uniform float uLo, uHi, uRadMul, uFocal, uDpr, uMaxPx, uDynMin;
+uniform vec3 uClipN; uniform float uClipD;
 uniform int uMode;
 out float vT; out vec3 vC; out vec3 vN; out vec3 vE1; out vec3 vE2; out vec2 vSig; out vec3 vW;
 vec3 octDecode(vec2 e){
@@ -260,7 +265,7 @@ void onb(vec3 n, out vec3 t1, out vec3 t2){
 }
 void main(){
   // 会場スキャンに載る点は捨てる (動体だけを残す)
-  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vE1=vec3(1,0,0); vE2=vec3(0,1,0); vSig=vec2(1e-6); return; }
+  if (dot(aPos,aPos) < 1e-9 || aDyn < uDynMin || dot(aPos,uClipN) > uClipD){ gl_Position = vec4(2.0,2.0,2.0,0.0); gl_PointSize=0.0; vT=0.0; vC=vec3(0); vN=vec3(0,0,1); vE1=vec3(1,0,0); vE2=vec3(0,1,0); vSig=vec2(1e-6); return; }
   vec4 eye = uView * vec4(aPos,1.0);
   gl_Position = uProj * eye;
   float v = (uMode==0)?aRefl : (uMode==1)?aSig : (uMode==2)?aNir :
@@ -360,6 +365,7 @@ precision highp float;
 in vec2 vUv; in vec3 vN; in vec3 vC; in float vDyn; in vec3 vW;
 uniform sampler2D uTex;
 uniform int uCmap; uniform float uShade; uniform vec3 uLightDir; uniform float uDynMin;
+uniform vec3 uClipN; uniform float uClipD;
 out vec4 frag;
 ${CMAP_GLSL}
 uniform sampler2D uVid; uniform vec4 uP0, uP1, uP2; uniform float uVidOn;
@@ -375,7 +381,7 @@ vec3 projectVideo(vec3 w, vec3 fallback){
 }
 
 void main(){
-  if (vDyn < uDynMin) discard;
+  if (vDyn < uDynMin || dot(vW, uClipN) > uClipD) discard;
   vec3 col = projectVideo(vW, cmap(uCmap, texture(uTex, vUv).r));
   if (uShade > 0.001){
     vec3 nn = normalize(vN);
@@ -859,7 +865,7 @@ const ui = {
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
   scolor:$("scolor"), bright:$("bright"),
-  dof:$("dof"), focustgt:$("focustgt"), focus:$("focus"), frange:$("frange"), blurall:$("blurall"), bloom:$("bloom"), vig:$("vig"),
+  dof:$("dof"), focustgt:$("focustgt"), clipon:$("clipon"), clipdeg:$("clipdeg"), clipd:$("clipd"), focus:$("focus"), frange:$("frange"), blurall:$("blurall"), bloom:$("bloom"), vig:$("vig"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -1156,6 +1162,17 @@ function syncVideo(){
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 }
+// 客席側クリップ: 舞台正面方向(axis)に沿って d より先の前景を隠す。会場には掛けない。
+function setClipUniforms(prog){
+  const u=n=>gl.getUniformLocation(prog,n);
+  if (ui.clipon.checked){
+    const a=+ui.clipdeg.value*Math.PI/180;
+    gl.uniform3f(u("uClipN"), Math.cos(a), Math.sin(a), 0.0);
+    gl.uniform1f(u("uClipD"), +ui.clipd.value);
+  } else {
+    gl.uniform3f(u("uClipN"), 0,0,0); gl.uniform1f(u("uClipD"), 1e9);
+  }
+}
 function setProjUniforms(prog, unit){
   const u=n=>gl.getUniformLocation(prog,n);
   const on = (ui.vidon.checked && PMAT) ? 1 : 0;
@@ -1349,7 +1366,7 @@ function loop(tms){
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.uniform1i(u("uTex"), 0);
-      setProjUniforms(meshProg, 1);
+      setProjUniforms(meshProg, 1); setClipUniforms(meshProg);
       gl.bindVertexArray(meshVao);
       gl.drawElements(gl.TRIANGLES, meshCount, gl.UNSIGNED_INT, 0);
       gl.bindVertexArray(null);
@@ -1364,7 +1381,7 @@ function loop(tms){
       gl.uniform1f(u("uBright"), +ui.bright.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
       gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
-      setProjUniforms(splatProg, 1);
+      setProjUniforms(splatProg, 1); setClipUniforms(splatProg);
       // ワールド上方かつ斜めからの平行光をビュー空間へ (Z-up)
       const LW = [0.45, -0.38, 0.81];
       gl.uniform3f(u("uLightDir"),
@@ -1403,6 +1420,7 @@ function loop(tms){
       gl.uniform1f(u("uHi"), levels.hi);
       gl.uniform1f(u("uBright"), +ui.bright.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
+      setClipUniforms(ptProg);
       if (+ui.opac.value < 1){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); }
       gl.bindVertexArray(vao);
       gl.drawArrays(gl.POINTS,0,N);
