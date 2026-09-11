@@ -114,6 +114,13 @@
       <option value="0">全編</option>
     </select></div>
   <div class="row"><button id="recbtn" style="width:100%">● Record 1080p</button></div>
+  <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Depth of field</label><input type="checkbox" id="dof"></div>
+  <div class="row"><label>Focus at target</label><input type="checkbox" id="focustgt" checked></div>
+  <div class="row"><label>Focus dist m</label><input type="range" id="focus" min="0.5" max="30" step="0.1" value="8"></div>
+  <div class="row"><label>Focus range m</label><input type="range" id="frange" min="0.3" max="15" step="0.1" value="3"></div>
+  <div class="row"><label>Blur (all)</label><input type="range" id="blurall" min="0" max="1" step="0.05" value="0"></div>
+  <div class="row"><label>Bloom</label><input type="range" id="bloom" min="0" max="2" step="0.05" value="0"></div>
+  <div class="row"><label>Vignette</label><input type="range" id="vig" min="0" max="1" step="0.05" value="0"></div>
   <div class="row">
     <button id="resetcam">Reset view</button>
     <button id="ply">Export PLY</button>
@@ -444,6 +451,110 @@ void main(){ gl_Position = uProj * uView * vec4(aPos,1.0); }`,
 precision highp float; uniform vec4 uColor; out vec4 frag;
 void main(){ frag = uColor; }`);
 
+// ---------- ポストエフェクト (被写界深度 / ブラー / ブルーム / ビネット) ----------
+// シーンを色+深度のFBOに描き、半解像度で2段階のガウスぼかしを作り、
+// 深度から求めた錯乱円の大きさで シャープ→弱ぼかし→強ぼかし を混ぜる。
+const FS_QUAD_VS = `#version 300 es
+precision highp float; out vec2 vUv;
+void main(){ vec2 p = vec2((gl_VertexID==1)?3.0:-1.0, (gl_VertexID==2)?3.0:-1.0);
+  vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
+const blurProg = compile(FS_QUAD_VS, `#version 300 es
+precision highp float; in vec2 vUv; uniform sampler2D uTex; uniform vec2 uDir; uniform float uRadius; out vec4 frag;
+void main(){
+  vec2 ts = 1.0 / vec2(textureSize(uTex,0));
+  vec3 acc = vec3(0.0); float wsum = 0.0;
+  for (int i=-8; i<=8; i++){
+    float x = float(i) / 8.0;
+    float w = exp(-4.5*x*x);
+    acc += texture(uTex, vUv + uDir * ts * float(i) * uRadius / 8.0).rgb * w; wsum += w;
+  }
+  frag = vec4(acc / wsum, 1.0);
+}`);
+const postProg = compile(FS_QUAD_VS, `#version 300 es
+precision highp float; in vec2 vUv;
+uniform sampler2D uScene, uDepth, uBlur1, uBlur2;
+uniform float uNear, uFar, uFocus, uRange, uDof, uBlurAll, uBloom, uBloomThr, uVig;
+out vec4 frag;
+float linz(float d){ float z = d*2.0-1.0; return 2.0*uNear*uFar / (uFar + uNear - z*(uFar-uNear)); }
+void main(){
+  vec3 c  = texture(uScene, vUv).rgb;
+  vec3 b1 = texture(uBlur1, vUv).rgb;
+  vec3 b2 = texture(uBlur2, vUv).rgb;
+  float z = linz(texture(uDepth, vUv).r);
+  float coc = clamp(abs(z - uFocus) / max(uRange, 0.05), 0.0, 1.0) * uDof;
+  vec3 col = coc < 0.5 ? mix(c, b1, coc*2.0) : mix(b1, b2, (coc-0.5)*2.0);
+  col = mix(col, b2, uBlurAll);
+  col += max(b2 - vec3(uBloomThr), 0.0) * uBloom;
+  float vg = 1.0 - uVig * smoothstep(0.35, 1.1, length(vUv-0.5)*1.5);
+  frag = vec4(col * vg, 1.0);
+}`);
+const post = { w:0, h:0, fbo:null, color:null, depth:null, half:[null,null], halfTex:[null,null] };
+function mkTex(w,h,internal,format,type,filter){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,internal,w,h,0,format,type,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  return t;
+}
+function postEnabled(){ return ui.dof.checked || +ui.blurall.value>0 || +ui.bloom.value>0 || +ui.vig.value>0; }
+function postSetup(w,h){
+  if (post.w===w && post.h===h) return;
+  post.w=w; post.h=h;
+  post.color = mkTex(w,h,gl.RGBA8,gl.RGBA,gl.UNSIGNED_BYTE,gl.LINEAR);
+  post.depth = mkTex(w,h,gl.DEPTH_COMPONENT24,gl.DEPTH_COMPONENT,gl.UNSIGNED_INT,gl.NEAREST);
+  post.fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, post.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,post.color,0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.TEXTURE_2D,post.depth,0);
+  const hw=Math.max(1,w>>1), hh=Math.max(1,h>>1);
+  for (let i=0;i<2;i++){
+    post.halfTex[i] = mkTex(hw,hh,gl.RGBA8,gl.RGBA,gl.UNSIGNED_BYTE,gl.LINEAR);
+    post.half[i] = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, post.half[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,post.halfTex[i],0);
+  }
+  post.blur1 = mkTex(hw,hh,gl.RGBA8,gl.RGBA,gl.UNSIGNED_BYTE,gl.LINEAR);
+  post.blur1fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, post.blur1fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,post.blur1,0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+function blurPass(srcTex, dstFbo, w, h, dir, radius){
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo); gl.viewport(0,0,w,h);
+  gl.useProgram(blurProg);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.uniform1i(gl.getUniformLocation(blurProg,"uTex"),0);
+  gl.uniform2f(gl.getUniformLocation(blurProg,"uDir"),dir[0],dir[1]);
+  gl.uniform1f(gl.getUniformLocation(blurProg,"uRadius"),radius);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+function postBegin(){
+  if (!postEnabled()) { gl.bindFramebuffer(gl.FRAMEBUFFER, null); return false; }
+  postSetup(canvas.width, canvas.height);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, post.fbo);
+  return true;
+}
+function postEnd(){
+  const w=post.w, h=post.h, hw=Math.max(1,w>>1), hh=Math.max(1,h>>1);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  // 弱ぼかし: 半解像度で 2px 相当
+  blurPass(post.color, post.half[0], hw, hh, [1,0], 2.0);
+  blurPass(post.halfTex[0], post.blur1fbo, hw, hh, [0,1], 2.0);
+  // 強ぼかし: 弱ぼかしをさらに 7px
+  blurPass(post.blur1, post.half[0], hw, hh, [1,0], 7.0);
+  blurPass(post.halfTex[0], post.half[1], hw, hh, [0,1], 7.0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0,0,w,h);
+  gl.useProgram(postProg);
+  const u=n=>gl.getUniformLocation(postProg,n);
+  const bind=(unit,tex,name)=>{ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D,tex); gl.uniform1i(u(name),unit); };
+  bind(0,post.color,"uScene"); bind(1,post.depth,"uDepth"); bind(2,post.blur1,"uBlur1"); bind(3,post.halfTex[1],"uBlur2");
+  gl.uniform1f(u("uNear"),0.05); gl.uniform1f(u("uFar"),300.0);
+  const focus = ui.focustgt.checked ? cam.dist : +ui.focus.value;
+  gl.uniform1f(u("uFocus"),focus); gl.uniform1f(u("uRange"),+ui.frange.value);
+  gl.uniform1f(u("uDof"), ui.dof.checked?1.0:0.0);
+  gl.uniform1f(u("uBlurAll"),+ui.blurall.value); gl.uniform1f(u("uBloom"),+ui.bloom.value);
+  gl.uniform1f(u("uBloomThr"),0.55); gl.uniform1f(u("uVig"),+ui.vig.value);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.enable(gl.DEPTH_TEST);
+}
+
 // ---------- 行列 ----------
 function perspective(fovy, aspect, near, far){
   const f = 1/Math.tan(fovy/2), nf = 1/(near-far);
@@ -744,6 +855,7 @@ const ui = {
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
   scolor:$("scolor"), bright:$("bright"),
+  dof:$("dof"), focustgt:$("focustgt"), focus:$("focus"), frange:$("frange"), blurall:$("blurall"), bloom:$("bloom"), vig:$("vig"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -1166,6 +1278,7 @@ function loop(tms){
 
   if (ui.vidon.checked) syncVideo();
   const dpr = resize();
+  const usePost = postBegin();
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.clearColor(0.012,0.012,0.02,1);
   gl.enable(gl.DEPTH_TEST);
@@ -1293,6 +1406,8 @@ function loop(tms){
       gl.disable(gl.BLEND);
     }
   }
+
+  if (usePost) postEnd();
 
   const t = playhead/INFO.fps;
   ui.time.textContent = `${fmtTime(t)} / ${fmtTime(INFO.duration_s)}  #${want}`;
