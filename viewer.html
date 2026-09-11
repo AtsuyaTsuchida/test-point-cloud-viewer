@@ -11,7 +11,7 @@
   #panel{position:absolute;top:12px;left:12px;width:230px;background:rgba(16,18,26,.88);
     border:1px solid #2a2e3e;border-radius:10px;padding:12px 14px;backdrop-filter:blur(6px);
     user-select:none;
-    max-height:calc(100vh - 12px - 64px);   /* 下の再生バーに被らない高さで止めてスクロール */
+    box-sizing:border-box;max-height:calc(100vh - 12px - 64px);   /* 下の再生バーに被らない高さで止めてスクロール */
     overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;}
   #panel::-webkit-scrollbar{width:6px;}
   #panel::-webkit-scrollbar-thumb{background:#3a4058;border-radius:3px;}
