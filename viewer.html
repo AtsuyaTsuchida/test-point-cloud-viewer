@@ -47,22 +47,22 @@
   <div class="sub" id="sub">Loading…</div>
   <div class="row"><label>Scene</label>
     <select id="scene">
-      <option value="mesh_splats" selected>Mesh venue + Splats</option>
-      <option value="points_all">Point cloud (all)</option>
+      <option value="mesh_splats">Mesh venue + Splats</option>
+      <option value="points_all" selected>Point cloud (all)</option>
       <option value="points_splats">Point venue + Splats</option>
       <option value="custom">Custom</option>
     </select></div>
   <div class="row"><label>Scene color</label>
     <select id="scolor">
-      <option value="orig" selected>Original</option>
-      <option value="white">All white</option>
+      <option value="orig">Original</option>
+      <option value="white" selected>All white</option>
       <option value="gray">Grayscale</option>
     </select></div>
   <div class="row"><label>Render</label>
     <select id="rmode">
-      <option value="1" selected>Splats</option>
+      <option value="1">Splats</option>
       <option value="2">Mesh</option>
-      <option value="0">Points</option>
+      <option value="0" selected>Points</option>
     </select></div>
   <div class="row"><label>Color</label>
     <select id="mode">
@@ -79,34 +79,34 @@
       <option value="2">Viridis</option>
       <option value="3">Turbo</option>
       <option value="4">Gray</option>
-      <option value="5" selected>Flat (neutral)</option>
-      <option value="6">White</option>
+      <option value="5">Flat (neutral)</option>
+      <option value="6" selected>White</option>
     </select></div>
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
   <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.05" value="0.85"></div>
-  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.05" max="1" step="0.05" value="1"></div>
-  <div class="row"><label>Brightness</label><input type="range" id="bright" min="0.2" max="2.5" step="0.05" value="1"></div>
+  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.05" max="1" step="0.05" value="0.4"></div>
+  <div class="row"><label>Brightness</label><input type="range" id="bright" min="0.2" max="2.5" step="0.05" value="1.1"></div>
   <div class="row"><label>Shading</label><input type="range" id="shade" min="0" max="1" step="0.05" value="0.7"></div>
   <div class="row"><label>Temporal median</label>
     <select id="tmed">
-      <option value="1" selected>Off</option>
+      <option value="1">Off</option>
       <option value="3">3 frames</option>
       <option value="5">5 frames</option>
-      <option value="9">9 frames</option>
+      <option value="9" selected>9 frames</option>
     </select></div>
   <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
   <div class="row"><label>Venue (scan)</label>
     <select id="venuemode">
-      <option value="mesh" selected>Mesh</option>
-      <option value="points">Point cloud</option>
+      <option value="mesh">Mesh</option>
+      <option value="points" selected>Point cloud</option>
       <option value="off">Off</option>
     </select></div>
   <input type="checkbox" id="venue" checked hidden>
-  <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
-  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="15"></div>
-  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.0"></div>
+  <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1.5"></div>
+  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="25"></div>
+  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.4"></div>
   <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
   <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="-38.5"></div>
   <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
@@ -780,8 +780,8 @@ const order = [];                 // LRU
 const MAX_CACHE = 280;            // ≈ 600MB
 const inflight = new Map();       // idx -> Promise
 let INFO=null;
-let TMED=1;                       // 時間中央値フィルタの枚数 (1=off)
-let SEED=15, GROW=1.0;            // 背景差の種(cm)と連結成長の測地距離予算(m)
+let TMED=9;                       // 時間中央値フィルタの枚数 (1=off)
+let SEED=25, GROW=1.4;            // 背景差の種(cm)と連結成長の測地距離予算(m)
 
 function parseFrame(buf){
   const dv = new DataView(buf);
@@ -916,7 +916,7 @@ ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
 ui.venuemode.onchange = ()=>{ ui.venue.checked = ui.venuemode.value!=="off"; if(ui.venuemode.value==="points") loadVenuePoints(); };
 // 会場と演奏者の描画モードを一括で切り替えるプリセット。個別に触ると Custom 表示になる。
 // 一括の色: 会場(元色/白/輝度) と 演奏者のカラーマップ を同時に切り替える
-let TINT = 0;
+let TINT = 1;   // 既定は All white
 ui.scolor.onchange = ()=>{
   const m = ui.scolor.value;
   TINT = m==="white" ? 1 : m==="gray" ? 2 : 0;
@@ -1500,6 +1500,7 @@ fetch("/info").then(r=>r.json()).then(info=>{
   initBuffers(info.n_points);
   setupVideo();
   loadVenue();
+  ui.scene.onchange(); ui.scolor.onchange();     // 既定プリセットを実際の状態へ反映
   getFrame(0).then(()=>{ setPlaying(true); });
   requestAnimationFrame(loop);
 });
