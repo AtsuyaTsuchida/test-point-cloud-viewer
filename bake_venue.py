@@ -457,7 +457,10 @@ def main():
     if len(gp) > 900000:
         keep = np.random.default_rng(0).choice(len(gp), 900000, replace=False); gp, gc = gp[keep], gc[keep]
     print(f"  会場点群 (ガウシアン中心): {len(gp)} 点")
+    # メッシュ座標 -> LiDAR座標 の4x4 (元データを同じ座標で扱う外部ツール用)
+    M = np.eye(4); M[:3, :3] = Rm; M[:3, 3] = Tm - Rm @ off
     np.savez_compressed(args.out,
+                        M_mesh_to_lidar=M.astype(np.float64),
                         gs_pos=gp, gs_rgb=gc,
                         verts=v_l.astype(np.float32),
                         colors=col.astype(np.float32),
