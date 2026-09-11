@@ -78,7 +78,13 @@
     </select></div>
   <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
-  <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
+  <div class="row"><label>Venue (scan)</label>
+    <select id="venuemode">
+      <option value="mesh" selected>Mesh</option>
+      <option value="points">Point cloud</option>
+      <option value="off">Off</option>
+    </select></div>
+  <input type="checkbox" id="venue" checked hidden>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
   <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="15"></div>
   <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.0"></div>
@@ -378,6 +384,40 @@ void main(){
   frag = vec4(vCol * uDim * (0.55 + 0.45*ndv), 1.0);
 }`);
 
+// 会場を点群で描く: 3DGSのガウシアン中心と色。演奏者と同じ「点」の見た目に揃えるモード。
+const vptProg = compile(`#version 300 es
+precision highp float;
+in vec3 aPos; in vec3 aCol;
+uniform mat4 uProj, uView; uniform float uSize, uDpr;
+out vec3 vCol;
+void main(){
+  vec4 eye = uView * vec4(aPos,1.0);
+  gl_Position = uProj * eye;
+  gl_PointSize = clamp(uSize * 6.0 / max(-eye.z, 0.8), 1.0, 24.0) * uDpr;
+  vCol = aCol;
+}`,`#version 300 es
+precision highp float;
+in vec3 vCol; uniform float uDim; out vec4 frag;
+void main(){
+  vec2 d = gl_PointCoord - 0.5;
+  if (dot(d,d) > 0.25) discard;
+  frag = vec4(vCol * uDim, 1.0);
+}`);
+let vptVao=null, vptCount=0, vptLoading=false;
+function loadVenuePoints(){
+  if (vptVao || vptLoading) return; vptLoading=true;
+  fetch("/venue_points?v="+INFO.gen).then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf=>{
+    const n=new DataView(buf).getUint32(4,true);
+    const pos=new Float32Array(buf,8,n*3), col=new Uint8Array(buf,8+n*12,n*3);
+    vptVao=gl.createVertexArray(); gl.bindVertexArray(vptVao);
+    let b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,pos,gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,col,gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.UNSIGNED_BYTE,true,0,0);
+    gl.bindVertexArray(null); vptCount=n; vptLoading=false;
+    console.log(`venue points: ${n}`);
+  }).catch(()=>{ vptLoading=false; });
+}
 const lineProg = compile(`#version 300 es
 precision highp float;
 in vec3 aPos; uniform mat4 uProj,uView;
@@ -526,6 +566,8 @@ function updateTex(fr, mode){
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,INFO.cols,INFO.rows,gl.RED,gl.UNSIGNED_BYTE,texBuf);
 }
+gl.bindAttribLocation(vptProg,0,"aPos"); gl.bindAttribLocation(vptProg,1,"aCol"); gl.linkProgram(vptProg);
+gl.bindAttribLocation(venueProg,0,"aPos"); gl.bindAttribLocation(venueProg,1,"aCol"); gl.linkProgram(venueProg);
 for (const p of [ptProg, splatProg, meshProg]){
   gl.bindAttribLocation(p,0,"aPos"); gl.bindAttribLocation(p,1,"aRefl");
   gl.bindAttribLocation(p,2,"aSig"); gl.bindAttribLocation(p,3,"aNir");
@@ -682,7 +724,7 @@ const ui = {
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
-  growm:$("growm"), vidon:$("vidon"), voff:$("voff"),
+  growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -730,6 +772,7 @@ function invalidate(){     // 前景抽出の条件が変わると全フレー�
   curFrame=-1; curData=null; meshFrame=-1;
 }
 ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
+ui.venuemode.onchange = ()=>{ ui.venue.checked = ui.venuemode.value!=="off"; if(ui.venuemode.value==="points") loadVenuePoints(); };
 ui.dynmin.onchange = ()=>{ SEED = +ui.dynmin.value; meshFrame=-1; if(GROW>0) invalidate(); };
 ui.growm.onchange = ()=>{ GROW = +ui.growm.value; meshFrame=-1; invalidate(); };
 $("resetcam").onclick = resetCam;
@@ -1094,7 +1137,17 @@ function loop(tms){
   const proj = perspective(55*Math.PI/180, canvas.width/canvas.height, 0.05, 300);
   const {v:view} = viewMatrix();
 
-  if (venueVao && ui.venue.checked){
+  if (ui.venuemode.value==="points" && vptVao){
+    gl.useProgram(vptProg);
+    gl.uniformMatrix4fv(gl.getUniformLocation(vptProg,"uProj"),false,proj);
+    gl.uniformMatrix4fv(gl.getUniformLocation(vptProg,"uView"),false,view);
+    gl.uniform1f(gl.getUniformLocation(vptProg,"uSize"), +ui.psize.value);
+    gl.uniform1f(gl.getUniformLocation(vptProg,"uDpr"), dpr);
+    gl.uniform1f(gl.getUniformLocation(vptProg,"uDim"), +ui.vdim.value);
+    gl.bindVertexArray(vptVao);
+    gl.drawArrays(gl.POINTS, 0, vptCount);
+    gl.bindVertexArray(null);
+  } else if (venueVao && ui.venuemode.value==="mesh"){
     gl.useProgram(venueProg);
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uProj"),false,proj);
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uView"),false,view);

@@ -451,7 +451,14 @@ def main():
     print(f"  舞台域の壁帯(z 1.6-2.6m)で15cm超: {100.0*(probe_d[band] >= 15).mean():.1f}%  "
           f"(座奏の頭より上=主に壁。低いほど壁の誤検出が少ない)")
 
+    # 会場を点群として描くモード用: ガウシアン中心と色 (不透明なものだけ、会場範囲内)
+    gsel = (gopa > 0.3) & np.all((g_l > lo_b) & (g_l < hi_b), axis=1)
+    gp = g_l[gsel].astype(np.float32); gc = np.clip(grgb[gsel] * 255, 0, 255).astype(np.uint8)
+    if len(gp) > 900000:
+        keep = np.random.default_rng(0).choice(len(gp), 900000, replace=False); gp, gc = gp[keep], gc[keep]
+    print(f"  会場点群 (ガウシアン中心): {len(gp)} 点")
     np.savez_compressed(args.out,
+                        gs_pos=gp, gs_rgb=gc,
                         verts=v_l.astype(np.float32),
                         colors=col.astype(np.float32),
                         faces=faces.astype(np.uint32),

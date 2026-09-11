@@ -555,9 +555,12 @@ def venue_distance_cm(pts):
     return out.astype(np.uint8)
 
 
+VENUE_POINTS = None      # 会場を点群で描くモード用のバイナリ (ガウシアン中心 + 色)
+
+
 def load_venue():
     """bake_venue.py が焼いた会場メッシュ (LiDAR座標系, 頂点カラー付き)。"""
-    global VENUE_DIST
+    global VENUE_DIST, VENUE_POINTS
     p = os.path.join(HERE, "venue.npz")
     if not os.path.exists(p):
         return None
@@ -567,6 +570,10 @@ def load_venue():
                       float(z["dist_cell"]))
         print(f"Venue distance grid: {z['dist'].shape} @"
               f"{float(z['dist_cell'])*100:.0f}cm")
+    if "gs_pos" in z:
+        gp = np.ascontiguousarray(z["gs_pos"].astype(np.float32)); gc = np.ascontiguousarray(z["gs_rgb"])
+        VENUE_POINTS = b"".join([struct.pack("<4sI", b"VPT1", len(gp)), gp.tobytes(), gc.tobytes()])
+        print(f"Venue points: {len(gp)}")
     v = z["verts"].astype(np.float32)
     c = np.clip(z["colors"] * 255.0, 0, 255).astype(np.uint8)
     f = z["faces"].astype(np.uint32)
@@ -703,6 +710,11 @@ def make_handler(src: OusterPcap):
                                json.dumps(sorted(VIDEOS)).encode())
                 elif self.path.startswith("/video/"):
                     self._send_video(unquote(os.path.basename(urlparse(self.path).path)))
+                elif urlparse(self.path).path == "/venue_points":
+                    if VENUE_POINTS is None:
+                        self._send(404, "text/plain", b"run bake_venue.py first")
+                    else:
+                        self._send(200, "application/octet-stream", VENUE_POINTS, cache=True)
                 elif urlparse(self.path).path == "/venue":
                     if venue is None:
                         self._send(404, "text/plain", b"run bake_venue.py first")
