@@ -48,6 +48,12 @@
       <option value="points_splats">Point venue + Splats</option>
       <option value="custom">Custom</option>
     </select></div>
+  <div class="row"><label>Scene color</label>
+    <select id="scolor">
+      <option value="orig" selected>Original</option>
+      <option value="white">All white</option>
+      <option value="gray">Grayscale</option>
+    </select></div>
   <div class="row"><label>Render</label>
     <select id="rmode">
       <option value="1" selected>Splats</option>
@@ -70,6 +76,7 @@
       <option value="3">Turbo</option>
       <option value="4">Gray</option>
       <option value="5" selected>Flat (neutral)</option>
+      <option value="6">White</option>
     </select></div>
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
@@ -185,6 +192,7 @@ vec3 cmap(int c, float t){
   if(c==2) return viridis(t);
   if(c==3) return turbo(t);
   if(c==5) return vec3(0.62, 0.56, 0.50) * (0.75 + 0.5*t);   // 会場の木質色に寄せた無彩色。反射率で僅かに濃淡
+  if(c==6) return vec3(1.0);
   return vec3(t);}
 `;
 
@@ -382,13 +390,14 @@ void main(){
 }`,`#version 300 es
 precision highp float;
 in vec3 vCol; in vec3 vC;
-uniform float uDim;
+uniform float uDim; uniform int uTint;
 out vec4 frag;
 void main(){
   // 面法線は持たないので画面微分から起こす (ローポリの面が読めるようになる)
   vec3 nn = normalize(cross(dFdx(vC), dFdy(vC)));
   float ndv = abs(nn.z);
-  frag = vec4(vCol * uDim * (0.55 + 0.45*ndv), 1.0);
+  vec3 c = uTint==1 ? vec3(1.0) : uTint==2 ? vec3(dot(vCol, vec3(0.299,0.587,0.114))) : vCol;
+  frag = vec4(c * uDim * (0.55 + 0.45*ndv), 1.0);
 }`);
 
 // 会場を点群で描く: 3DGSのガウシアン中心と色。演奏者と同じ「点」の見た目に揃えるモード。
@@ -404,11 +413,12 @@ void main(){
   vCol = aCol;
 }`,`#version 300 es
 precision highp float;
-in vec3 vCol; uniform float uDim; out vec4 frag;
+in vec3 vCol; uniform float uDim; uniform int uTint; out vec4 frag;
 void main(){
   vec2 d = gl_PointCoord - 0.5;
   if (dot(d,d) > 0.25) discard;
-  frag = vec4(vCol * uDim, 1.0);
+  vec3 c = uTint==1 ? vec3(1.0) : uTint==2 ? vec3(dot(vCol, vec3(0.299,0.587,0.114))) : vCol;
+  frag = vec4(c * uDim, 1.0);
 }`);
 let vptVao=null, vptCount=0, vptLoading=false;
 function loadVenuePoints(){
@@ -732,6 +742,7 @@ const ui = {
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
+  scolor:$("scolor"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -781,6 +792,13 @@ function invalidate(){     // 前景抽出の条件が変わると全フレー�
 ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
 ui.venuemode.onchange = ()=>{ ui.venue.checked = ui.venuemode.value!=="off"; if(ui.venuemode.value==="points") loadVenuePoints(); };
 // 会場と演奏者の描画モードを一括で切り替えるプリセット。個別に触ると Custom 表示になる。
+// 一括の色: 会場(元色/白/輝度) と 演奏者のカラーマップ を同時に切り替える
+let TINT = 0;
+ui.scolor.onchange = ()=>{
+  const m = ui.scolor.value;
+  TINT = m==="white" ? 1 : m==="gray" ? 2 : 0;
+  ui.cmap.value = m==="white" ? "6" : m==="gray" ? "4" : "5";
+};
 const SCENES = { mesh_splats:["mesh","1"], points_all:["points","0"], points_splats:["points","1"] };
 ui.scene.onchange = ()=>{
   const s = SCENES[ui.scene.value]; if(!s) return;
@@ -1162,6 +1180,7 @@ function loop(tms){
     gl.uniform1f(gl.getUniformLocation(vptProg,"uSize"), +ui.psize.value);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDpr"), dpr);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDim"), +ui.vdim.value);
+    gl.uniform1i(gl.getUniformLocation(vptProg,"uTint"), TINT);
     gl.bindVertexArray(vptVao);
     gl.drawArrays(gl.POINTS, 0, vptCount);
     gl.bindVertexArray(null);
@@ -1170,6 +1189,7 @@ function loop(tms){
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uProj"),false,proj);
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uView"),false,view);
     gl.uniform1f(gl.getUniformLocation(venueProg,"uDim"), +ui.vdim.value);
+    gl.uniform1i(gl.getUniformLocation(venueProg,"uTint"), TINT);
     gl.bindVertexArray(venueVao);
     gl.drawElements(gl.TRIANGLES, venueCount, gl.UNSIGNED_INT, 0);
     gl.bindVertexArray(null);
