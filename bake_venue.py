@@ -4,9 +4,10 @@
 
   python3 bake_venue.py [--scan DIR] [--out venue.npz]
 
-Z軸は両者とも既に一致している(床がZ≒0, メートル, Z-up)ため、位置合わせは
-Z軸まわりの回転+XY平行移動の3自由度に落ちる。床面へ投影した占有マップの
-FFT相互相関でヨー角を全探索し、そのままXYシフトを読む。
+位置合わせは2段: まずZ軸まわりの回転+XY平行移動の3自由度を、床面へ投影した
+占有マップのFFT相互相関で全探索し(矩形平面図の180°曖昧性は3Dで再評価して解く)、
+次に点対平面ICPで6自由度に詰める(インライアRMS 3cm)。スケール誤差は0.33%と
+実測されたので剛体で足りる。
 
 色は3DGS(sh_degree=0なのでf_dcがそのままRGB)からボクセル平均で拾う。
 """
@@ -62,7 +63,7 @@ def load_gaussians(path):
     return xyz, rgb, opacity
 
 
-def sample_mesh(verts, faces, n, seed=0):
+def sample_mesh(verts, faces, n, seed=0, with_normals=False):
     """三角形の面積に比例して表面上に点を撒く。頂点をそのまま使うと、
     細かい造作に頂点が集中し大きな平面がスカスカになって相関が偏る。"""
     rng = np.random.default_rng(seed)
@@ -77,7 +78,12 @@ def sample_mesh(verts, faces, n, seed=0):
     v = rng.random(n)
     flip = u + v > 1.0
     u[flip], v[flip] = 1.0 - u[flip], 1.0 - v[flip]
-    return a[f] + (b[f] - a[f]) * u[:, None] + (c[f] - a[f]) * v[:, None]
+    pts = a[f] + (b[f] - a[f]) * u[:, None] + (c[f] - a[f]) * v[:, None]
+    if not with_normals:
+        return pts
+    n = np.cross(b - a, c - a)
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+    return pts, n[f]
 
 
 def occupancy(xy, half, cell):
@@ -183,6 +189,84 @@ def dist_lookup(dist, origin, cell, pts):
                        np.minimum(v * int(round(cell * 100)), 254))
     return out.astype(np.uint8)
 
+
+
+
+class NearestSurface:
+    """表面サンプルをボクセルに集約し、最寄りボクセルの代表点と法線をO(1)で引く。
+    KD-treeが無い環境向け。BFSで最寄りIDを周囲へ伝播させておく。"""
+
+    def __init__(self, pts, nrm, cell=0.06, max_d=6):
+        self.cell = cell
+        pad = cell * (max_d + 1)
+        self.o = pts.min(0) - pad
+        self.dims = np.ceil((pts.max(0) + pad - self.o) / cell).astype(np.int64) + 1
+        k = ((pts - self.o) / cell).astype(np.int64)
+        lin = (k[:, 0] * self.dims[1] + k[:, 1]) * self.dims[2] + k[:, 2]
+        uniq, inv = np.unique(lin, return_inverse=True)
+        cnt = np.bincount(inv).astype(np.float64)
+        P = np.zeros((len(uniq), 3)); np.add.at(P, inv, pts); P /= cnt[:, None]
+        N = np.zeros((len(uniq), 3)); np.add.at(N, inv, nrm)
+        N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+        self.P, self.N = P, N
+        near = np.full(tuple(self.dims), -1, np.int32)
+        near[k[:, 0], k[:, 1], k[:, 2]] = inv.astype(np.int32)
+        for _ in range(max_d):
+            prev = near
+            near = prev.copy()
+            for ax in range(3):
+                for sh in (1, -1):
+                    cand = np.roll(prev, sh, axis=ax)
+                    fill = (near < 0) & (cand >= 0)
+                    near[fill] = cand[fill]
+            if np.array_equal(near, prev):
+                break
+        self.near = near
+
+    def query(self, q):
+        k = ((q - self.o) / self.cell).astype(np.int64)
+        ok = np.all((k >= 0) & (k < self.dims), axis=1)
+        idx = np.full(len(q), -1, np.int32)
+        idx[ok] = self.near[k[ok, 0], k[ok, 1], k[ok, 2]]
+        good = idx >= 0
+        return self.P[np.maximum(idx, 0)], self.N[np.maximum(idx, 0)], good
+
+
+def icp_point_to_plane(src, ns, iters=40, d_start=0.40, d_end=0.10, verbose=True):
+    """src(LiDAR点, 対象座標系) を表面へ寄せる剛体変換 (R,t) を返す。
+    対応距離のしきい値を徐々に絞り、法線方向の残差を最小化する。"""
+    R = np.eye(3); t = np.zeros(3)
+    cur = src.copy()
+    for it in range(iters):
+        d_max = d_start + (d_end - d_start) * min(1.0, it / max(iters * 0.6, 1))
+        q, n, good = ns.query(cur)
+        diff = cur - q
+        dist = np.abs((diff * n).sum(1))
+        m = good & (dist < d_max)
+        if m.sum() < 100:
+            break
+        p, qq, nn = cur[m], q[m], n[m]
+        # 小回転 w と並進 v について線形化: ((w x p) + v - (p - q)).n = 0
+        A = np.hstack([np.cross(p, nn), nn])            # (M,6)
+        b = -((p - qq) * nn).sum(1)
+        x, *_ = np.linalg.lstsq(A, b, rcond=None)
+        w, v = x[:3], x[3:]
+        th = np.linalg.norm(w)
+        if th > 1e-12:
+            k = w / th
+            K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+            dR = np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
+        else:
+            dR = np.eye(3)
+        cur = cur @ dR.T + v
+        R = dR @ R; t = dR @ t + v
+        rms = float(np.sqrt((dist[m] ** 2).mean()))
+        if verbose and (it % 8 == 0 or it == iters - 1):
+            print(f"    icp {it:2d}: d_max {d_max*100:4.0f}cm  inliers {m.sum():6d}  "
+                  f"rms {rms*100:.1f}cm  |step| {th*57.3:.3f}deg {np.linalg.norm(v)*100:.2f}cm")
+        if th < 1e-6 and np.linalg.norm(v) < 1e-5:
+            break
+    return R, t
 
 def bake_colors(verts, gxyz, grgb, vox=0.08, rings=2):
     """各頂点の近傍ボクセルにあるガウシアンの平均色を割り当てる。"""
@@ -295,18 +379,33 @@ def main():
 
     th = np.deg2rad(deg)
     c, s = np.cos(th), np.sin(th)
-    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-    T = np.array([t[0], t[1], 0.0])
+    R3 = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    T3 = np.array([t[0], t[1], dz])
+
+    # ここまでは3自由度。残るロール/ピッチと細かなずれを点対平面ICPで詰める。
+    # LiDAR点をメッシュ座標へ戻し、メッシュ表面へ寄せる剛体変換を求める。
+    print("  refining with 6-DoF point-to-plane ICP ...")
+    surf_n, nrm_n = sample_mesh(verts, faces, 1500000, seed=1, with_normals=True)
+    ns = NearestSurface(surf_n, nrm_n)
+    lid_m = (lid - T3) @ R3 + off                       # LiDAR -> メッシュ座標 (R3^-1)
+    sub = lid_m[rng0.choice(len(lid_m), 60000, replace=False)]
+    Ri, ti = icp_point_to_plane(sub, ns)
+    # 合成: mesh -> lidar は  p_l = R3 (p_m - off) + T3、ICPは p_m' = Ri p_m + ti を
+    # LiDAR側に施したものなので、逆に mesh 側へ取り込む: p_m = Ri^-1 (p_m' - ti)
+    Rm = R3 @ Ri.T
+    Tm = T3 - R3 @ (Ri.T @ ti)
 
     def to_lidar(p):
-        q = (p - off) @ R.T + T
-        q[:, 2] += dz
-        return q
+        return (p - off) @ Rm.T + Tm
+
+    def to_mesh_icp(p_l):
+        return (p_l - Tm) @ Rm + off
 
     v_l = to_lidar(verts)
     g_l = to_lidar(gxyz)
-    print(f"  確定: yaw {deg:.2f} deg   XY ({t[0]:+.2f}, {t[1]:+.2f}) m   "
-          f"dz {dz:+.3f} m   一致 {100*best_s:.1f}%")
+    ang = np.degrees(np.arccos(np.clip((np.trace(Ri) - 1) / 2, -1, 1)))
+    print(f"  3-DoF: yaw {deg:.2f} deg  XY ({t[0]:+.2f}, {t[1]:+.2f})  dz {dz:+.3f}  一致 {100*best_s:.1f}%")
+    print(f"  ICP補正: 回転 {ang:.3f} deg  並進 {np.linalg.norm(ti)*100:.1f} cm")
     print(f"  mesh bbox in LiDAR frame: "
           f"X {v_l[:,0].min():.1f}..{v_l[:,0].max():.1f}  "
           f"Y {v_l[:,1].min():.1f}..{v_l[:,1].max():.1f}  "
@@ -332,21 +431,32 @@ def main():
     print(f"  colored {100.0*found.mean():.1f}% of vertices")
 
     print("[5/5] building distance grid (for dynamic-only extraction) ...")
-    dist, dorg = distance_grid(surf_l)
+    # 距離グリッドの元は「メッシュ表面 ∪ ガウシアン中心」にする。ローポリメッシュは
+    # 頂点間隔0.5m級で、音響壁のルーバー(奥行き10-15cm)のような細部を平面に均して
+    # しまい、そこに当たったLiDAR点が"会場に無い"と誤判定される。ガウシアンは
+    # 細部を持つが疎な場所もあるので、メッシュを下地として合成する。
+    lo_b, hi_b = v_l.min(0) - 0.5, v_l.max(0) + 0.5      # 浮遊ガウシアンで格子が肥大化しないようメッシュ範囲に切る
+    g_solid = g_l[(gopa > 0.3) & np.all((g_l > lo_b) & (g_l < hi_b), axis=1)]
+    occ_src = np.vstack([surf_l, g_solid])
+    print(f"  距離グリッド用: メッシュ表面 {len(surf_l)} + ガウシアン {len(g_solid)}")
+    dist, dorg = distance_grid(occ_src, cell=0.05, max_d=16)
     hit = (dist < 255)
-    print(f"  grid {tuple(dist.shape)} @10cm  "
+    print(f"  grid {tuple(dist.shape)} @5cm  "
           f"({dist.nbytes/1e6:.1f} MB, {100.0*hit.mean():.1f}% within 1.2 m)")
-    probe_d = dist_lookup(dist, dorg, 0.10, lid)
-    for thr in (10, 20, 30, 40):
+    probe_d = dist_lookup(dist, dorg, 0.05, lid)
+    for thr in (5, 10, 15, 20, 30):
         print(f"  静止LiDAR点のうち会場から{thr:3d}cm超: "
               f"{100.0*(probe_d > thr).mean():.1f}%")
+    band = (lid[:, 2] > 1.6) & (lid[:, 2] < 2.6) & (np.hypot(lid[:, 0], lid[:, 1]) < 10)
+    print(f"  舞台域の壁帯(z 1.6-2.6m)で15cm超: {100.0*(probe_d[band] >= 15).mean():.1f}%  "
+          f"(座奏の頭より上=主に壁。低いほど壁の誤検出が少ない)")
 
     np.savez_compressed(args.out,
                         verts=v_l.astype(np.float32),
                         colors=col.astype(np.float32),
                         faces=faces.astype(np.uint32),
                         dist=dist, dist_origin=dorg.astype(np.float32),
-                        dist_cell=np.float32(0.10),
+                        dist_cell=np.float32(0.05),
                         yaw_deg=np.float32(deg), txy=t.astype(np.float32),
                         dz=np.float32(dz))
     print(f"saved: {args.out}  ({os.path.getsize(args.out)/1e6:.1f} MB)")

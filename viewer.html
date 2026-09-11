@@ -79,8 +79,8 @@
   <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
   <div class="row"><label>Venue (scan)</label><input type="checkbox" id="venue" checked></div>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1"></div>
-  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="10"></div>
-  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.2"></div>
+  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="15"></div>
+  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.0"></div>
   <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
   <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="0"></div>
   <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
@@ -598,7 +598,7 @@ const MAX_CACHE = 280;            // ≈ 600MB
 const inflight = new Map();       // idx -> Promise
 let INFO=null;
 let TMED=1;                       // 時間中央値フィルタの枚数 (1=off)
-let SEED=10, GROW=1.2;            // 背景差の種(cm)と連結成長の測地距離予算(m)
+let SEED=15, GROW=1.0;            // 背景差の種(cm)と連結成長の測地距離予算(m)
 
 function parseFrame(buf){
   const dv = new DataView(buf);
@@ -624,7 +624,7 @@ function getFrame(i){
     return Promise.resolve(cache.get(i));
   }
   if (inflight.has(i)) return inflight.get(i);
-  const p = fetch("/frame/"+i+"?tm="+TMED+(GROW>0?"&seed="+SEED+"&grow="+GROW:"")).then(r=>{
+  const p = fetch("/frame/"+i+"?tm="+TMED+(GROW>0?"&seed="+SEED+"&grow="+GROW:"")+"&v="+INFO.gen).then(r=>{
     if(!r.ok) throw new Error("frame "+i);
     return r.arrayBuffer();
   }).then(buf=>{
@@ -686,7 +686,8 @@ const ui = {
 
 // ---------- 会場メッシュ (起動時に一度だけ取得) ----------
 let venueVao=null, venueCount=0;
-fetch("/venue").then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf=>{
+function loadVenue(){   // INFO(世代番号)が要るので /info 取得後に呼ぶ
+fetch("/venue?v="+INFO.gen).then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf=>{
   const dv=new DataView(buf);
   const nv=dv.getUint32(4,true), nf=dv.getUint32(8,true);
   let o=12;
@@ -708,6 +709,7 @@ fetch("/venue").then(r=>{ if(!r.ok) throw 0; return r.arrayBuffer(); }).then(buf
   venueCount=nf*3;
   console.log(`venue mesh: ${nv} verts / ${nf} tris`);
 }).catch(()=>{ ui.venue.checked=false; console.log("venue mesh not available"); });
+}
 const MAX_PX = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
 let playing=false, playhead=0, curFrame=-1, curData=null, lastT=0, levelDirty=true;
 
@@ -1250,6 +1252,7 @@ fetch("/info").then(r=>r.json()).then(info=>{
   ui.seek.max = info.n_frames-1;
   initBuffers(info.n_points);
   setupVideo();
+  loadVenue();
   getFrame(0).then(()=>{ setPlaying(true); });
   requestAnimationFrame(loop);
 });

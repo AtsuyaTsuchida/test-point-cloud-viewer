@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
+from scipy import ndimage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,6 +38,10 @@ SIG_CAP_K = 0.010        # σの距離比上限。斜入射面の標本間隔は
 SIG_CAP_B = 0.005        # 忠実に覆うと筋状に伸びる。覆いきらず隙間を残す方を選ぶ。
                          # 値はフォールバック半径 rr*0.0092 に合わせてある。
 MAX_ASPECT = 2.0         # 楕円の最大扁平率
+STAGE_R = 10.0           # 会場距離による前景判定を適用する範囲 (センサーからの水平距離)
+STAGE_Z = 2.6            # 同、高さ上限。天井や高所のスキャン欠損を前景にしないための空間事前
+MIN_CLUSTER = 12         # 前景クラスタの最小画素数。単発のレンジノイズを落とす
+GROW_VMIN = 8            # 成長がスキャン表面(会場距離がこれ未満)へ入るのを禁止する [cm]
 LOG_R_BASE = 1.0182      # 半径のu8対数エンコード: r = 0.004 * BASE**k
 LOG_R_MIN = 0.004
 
@@ -276,15 +281,37 @@ class OusterPcap:
         pts = np.ascontiguousarray(np.moveaxis(xyz, 0, -1).reshape(-1, 3),
                                    np.float32)
         quads = self._quads(rng)
-        # 背景より手前に何cm出ているか。背景が無い画素は新規出現として255。
+        # 前景の証拠は2系統を合成する:
+        #  (a) 時間差分: 背景(時間中央値)より手前に何cm出ているか。動くものに画素精度で効く。
+        #      ただし座奏の演奏者や楽器のように動かないものは背景に吸収されて拾えない。
+        #  (b) 会場距離: 3DGSスキャン表面から何cm離れているか。静止していても
+        #      スキャンに無いものを拾う。天井などのスキャン欠損を誤検出しないよう
+        #      ステージ域(STAGE_R, STAGE_Z)に限る。
         bg = self.background()
         rf = rng.astype(np.float32)
-        fg = np.where((rng > 0) & (bg > 0), (bg - rf) / 10.0,
-                      np.where(rng > 0, 255.0, 0.0))
-        dyn = np.clip(fg, 0.0, 255.0).astype(np.uint8)
+        fg_t = np.where((rng > 0) & (bg > 0), (bg - rf) / 10.0,
+                        np.where(rng > 0, 255.0, 0.0))
+        fg_t = np.clip(fg_t, 0.0, 255.0)
+        venue_raw = venue_distance_cm(pts.astype(np.float64))
+        fg_v = venue_raw.astype(np.float32).reshape(rng.shape)
+        rxy = np.hypot(xyz[0], xyz[1])
+        in_stage = (rxy < STAGE_R) & (xyz[2] < STAGE_Z)
+        fg_v = np.where(in_stage, fg_v, 0.0)
+        dyn = np.where(in_stage, np.maximum(fg_t, fg_v), 0.0).astype(np.uint8).reshape(-1)
         if seed_cm > 0 and grow_m > 0.0:
-            grown = self._grow_dynamic(xyz, rng, dyn, seed_cm, grow_m)
-            dyn = np.where(grown, 255, 0).astype(np.uint8)
+            grown = self._grow_dynamic(xyz, rng, dyn, seed_cm, grow_m,
+                                       venue_cm=venue_raw).reshape(rng.shape)
+            # 連結成分ごとに画素数を数え、小さすぎるものはレンジノイズとして捨てる
+            lab, n_lab = ndimage.label(grown)
+            if n_lab:
+                sizes = np.bincount(lab.reshape(-1))
+                keep = sizes >= MIN_CLUSTER
+                keep[0] = False
+                grown = keep[lab]
+            # 成長は面の連続性だけを見るので、舞台上の種から壁や天井へ這い上がる。
+            # 対象は舞台上の演奏者と楽器なので、舞台域の外は最終的に落とす。
+            grown &= in_stage
+            dyn = np.where(grown, 255, 0).astype(np.uint8).reshape(-1)
         t_rel = float(self.frame_ts[i] - self.frame_ts[0])
         header = struct.pack("<4sIff", b"OPC5", pts.shape[0], t_rel, self.fps)
         return b"".join([header, pts.tobytes(),
@@ -316,9 +343,13 @@ class OusterPcap:
     # 消える。確実な動体(種)からレンジ画像の隣接を辿り、測地距離が予算内なら
     # 会場からの距離に関わらず取り込む。床は斜入射で1ステップが0.8m級になり
     # 予算をすぐ超えるため、そのまま漏れ出しの歯止めになる。
-    def _grow_dynamic(self, xyz, rng, dyn_cm, seed_cm, budget, iters=16):
+    def _grow_dynamic(self, xyz, rng, dyn_cm, seed_cm, budget, iters=16, venue_cm=None):
         H, W = self.H, self.W
         V = rng > 0
+        # スキャン済み表面(ピアノ・床・壁)の上へは広げない。演奏者がピアノに接して
+        # いると成長がピアノ表面へ流れ込み、3DGSにある部分まで前景になる。
+        if venue_cm is not None:
+            V = V & (venue_cm.reshape(H, W) >= GROW_VMIN)
         rf = rng.astype(np.float32)
         INF = np.float32(1e9)
 
@@ -573,6 +604,9 @@ def make_handler(src: OusterPcap):
         "serial": src.meta.get("sensor_info", {}).get("prod_sn", "?"),
         "mode": src.meta.get("config_params", {}).get("lidar_mode", "?"),
         "pcap": os.path.basename(src.pcap_path),
+        # 前景判定は venue.npz と背景モデルに依存する。起動ごとに変わる番号をURLに
+        # 付けさせ、ブラウザが前回起動時のフレームをキャッシュから返さないようにする。
+        "gen": int(time.time()),
     }
     info_json = json.dumps(info).encode()
 
@@ -637,7 +671,7 @@ def make_handler(src: OusterPcap):
                                json.dumps(sorted(VIDEOS)).encode())
                 elif self.path.startswith("/video/"):
                     self._send_video(unquote(os.path.basename(urlparse(self.path).path)))
-                elif self.path == "/venue":
+                elif urlparse(self.path).path == "/venue":
                     if venue is None:
                         self._send(404, "text/plain", b"run bake_venue.py first")
                     else:
