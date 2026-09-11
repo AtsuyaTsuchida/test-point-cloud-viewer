@@ -18,6 +18,7 @@
   #panel h1{font-size:13px;margin:0 0 2px;color:#fff;font-weight:600;}
   #panel .sub{color:#7a8199;font-size:11px;margin-bottom:10px;}
   .row{display:flex;align-items:center;justify-content:space-between;margin:7px 0;gap:8px;}
+  .row[hidden]{display:none;}   /* display:flex が hidden 属性を打ち消さないように */
   .row label{color:#aab;white-space:nowrap;}
   select,button{background:#232736;color:#dde;border:1px solid #3a4058;border-radius:6px;
     padding:3px 8px;font:inherit;font-size:12px;}
@@ -27,6 +28,12 @@
   input[type=range]{width:120px;accent-color:#e66a4e;}
   input[type=checkbox]{accent-color:#e66a4e;}
   #stats{color:#7a8199;font-size:11px;margin-top:10px;border-top:1px solid #2a2e3e;padding-top:8px;}
+  #panel details{border-top:1px solid #2a2e3e;padding:4px 0 2px;}
+  #panel details details{border-top:none;margin-left:4px;}
+  #panel summary{cursor:pointer;color:#dde;font-weight:600;font-size:12px;padding:4px 0;list-style:none;}
+  #panel summary::before{content:"▸ ";color:#7a8199;}
+  #panel details[open] > summary::before{content:"▾ ";}
+  #panel details details summary{font-weight:500;color:#aab;}
   #bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:12px;
     padding:10px 16px;background:rgba(12,14,20,.9);border-top:1px solid #23273a;}
   #play{width:44px;height:32px;font-size:15px;}
@@ -45,26 +52,39 @@
 <div id="panel">
   <h1 id="ttl">LiDAR Point Cloud Viewer</h1>
   <div class="sub" id="sub">Loading…</div>
-  <div class="row"><label>Scene</label>
+
+  <details data-sec="scene" open><summary>Scene</summary>
+  <div class="row"><label>Preset</label>
     <select id="scene">
       <option value="mesh_splats">Mesh venue + Splats</option>
       <option value="points_all" selected>Point cloud (all)</option>
       <option value="points_splats">Point venue + Splats</option>
       <option value="custom">Custom</option>
     </select></div>
-  <div class="row"><label>Scene color</label>
+  <div class="row"><label>Color</label>
     <select id="scolor">
       <option value="orig">Original</option>
       <option value="white" selected>All white</option>
       <option value="gray">Grayscale</option>
     </select></div>
+  <div class="row"><button id="resetcam">Reset view</button>
+    <select id="reclen">
+      <option value="10">10 s</option>
+      <option value="30" selected>30 s</option>
+      <option value="60">60 s</option>
+      <option value="0">Full</option>
+    </select></div>
+  <div class="row"><button id="recbtn" style="width:100%">● Record 1080p</button></div>
+  </details>
+
+  <details data-sec="perf"><summary>Performers (LiDAR)</summary>
   <div class="row"><label>Render</label>
     <select id="rmode">
       <option value="1">Splats</option>
       <option value="2">Mesh</option>
       <option value="0" selected>Points</option>
     </select></div>
-  <div class="row"><label>Color</label>
+  <div class="row"><label>Channel</label>
     <select id="mode">
       <option value="0" selected>Reflectivity</option>
       <option value="1">Signal</option>
@@ -85,8 +105,6 @@
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
   <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.05" value="0.85"></div>
-  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.05" max="1" step="0.05" value="0.4"></div>
-  <div class="row"><label>Brightness</label><input type="range" id="bright" min="0.2" max="2.5" step="0.05" value="1.1"></div>
   <div class="row"><label>Shading</label><input type="range" id="shade" min="0" max="1" step="0.05" value="0.7"></div>
   <div class="row"><label>Temporal median</label>
     <select id="tmed">
@@ -95,9 +113,20 @@
       <option value="5">5 frames</option>
       <option value="9" selected>9 frames</option>
     </select></div>
+  <div class="row"><label>Stage box clip</label><input type="checkbox" id="clipon" checked></div>
+  <div class="row"><label>X min (audience)</label><input type="range" id="bxmin" min="-8" max="4" step="0.1" value="-1.4"></div>
+  <div class="row"><label>X max (piano)</label><input type="range" id="bxmax" min="-2" max="10" step="0.1" value="3.0"></div>
+  <div class="row"><label>Y min</label><input type="range" id="bymin" min="-8" max="2" step="0.1" value="-2.2"></div>
+  <div class="row"><label>Y max</label><input type="range" id="bymax" min="-2" max="8" step="0.1" value="2.4"></div>
+  <details data-sec="perf-adv"><summary>Extraction (advanced)</summary>
+  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="25"></div>
+  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.4"></div>
   <div class="row"><label>Size falloff</label><input type="checkbox" id="atten" checked></div>
-  <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
-  <div class="row"><label>Venue (scan)</label>
+  </details>
+  </details>
+
+  <details data-sec="venue"><summary>Venue (3DGS)</summary>
+  <div class="row"><label>Show as</label>
     <select id="venuemode">
       <option value="mesh">Mesh</option>
       <option value="points" selected>Point cloud</option>
@@ -105,41 +134,34 @@
     </select></div>
   <input type="checkbox" id="venue" checked hidden>
   <div class="row"><label>Venue brightness</label><input type="range" id="vdim" min="0.2" max="1.5" step="0.05" value="1.5"></div>
-  <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="25"></div>
-  <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.4"></div>
-  <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
-  <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="-38.5"></div>
-  <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
-  <div class="row"><label>Record</label>
-    <select id="reclen">
-      <option value="10">10 s</option>
-      <option value="30" selected>30 s</option>
-      <option value="60">60 s</option>
-      <option value="0">全編</option>
-    </select></div>
-  <div class="row"><button id="recbtn" style="width:100%">● Record 1080p</button></div>
-  <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Stage box clip</label><input type="checkbox" id="clipon" checked></div>
-  <div class="row"><label>X min (audience)</label><input type="range" id="bxmin" min="-8" max="4" step="0.1" value="-1.4"></div>
-  <div class="row"><label>X max (piano)</label><input type="range" id="bxmax" min="-2" max="10" step="0.1" value="3.0"></div>
-  <div class="row"><label>Y min</label><input type="range" id="bymin" min="-8" max="2" step="0.1" value="-2.2"></div>
-  <div class="row"><label>Y max</label><input type="range" id="bymax" min="-2" max="8" step="0.1" value="2.4"></div>
-  <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Erase venue (click)</label><input type="checkbox" id="erase"></div>
+  <div class="row"><label>Erase (click)</label><input type="checkbox" id="erase"></div>
   <div class="row"><label>Erase size m</label><input type="range" id="esize" min="0.2" max="3" step="0.1" value="1.0"></div>
   <div class="row"><button id="eundo">Undo erase</button><button id="eclear">Clear boxes</button><span id="ecount" style="color:#7a8199;font-size:11px"></span></div>
-  <div class="row" style="border-top:1px solid #2a2e3e;padding-top:6px"><label>Depth of field</label><input type="checkbox" id="dof"></div>
+  </details>
+
+  <details data-sec="look"><summary>Look</summary>
+  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.05" max="1" step="0.05" value="0.4"></div>
+  <div class="row"><label>Brightness</label><input type="range" id="bright" min="0.2" max="2.5" step="0.05" value="1.1"></div>
+  <div class="row"><label>Depth of field</label><input type="checkbox" id="dof"></div>
   <div class="row"><label>Focus at target</label><input type="checkbox" id="focustgt" checked></div>
   <div class="row"><label>Focus dist m</label><input type="range" id="focus" min="0.5" max="30" step="0.1" value="8"></div>
   <div class="row"><label>Focus range m</label><input type="range" id="frange" min="0.3" max="15" step="0.1" value="3"></div>
   <div class="row"><label>Blur (all)</label><input type="range" id="blurall" min="0" max="1" step="0.05" value="0"></div>
   <div class="row"><label>Bloom</label><input type="range" id="bloom" min="0" max="2" step="0.05" value="0"></div>
   <div class="row"><label>Vignette</label><input type="range" id="vig" min="0" max="1" step="0.05" value="0"></div>
-  <div class="row">
-    <button id="resetcam">Reset view</button>
-    <button id="ply">Export PLY</button>
-  </div>
-  <div class="row">
-    <button id="gsply" style="width:100%">Export 3DGS PLY (current frame)</button>
-  </div>
+  <div class="row"><label>Range rings</label><input type="checkbox" id="rings"></div>
+  </details>
+
+  <details data-sec="video"><summary>Video</summary>
+  <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
+  <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="-38.5"></div>
+  <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
+  </details>
+
+  <details data-sec="export"><summary>Export</summary>
+  <div class="row"><button id="ply">Export PLY</button><button id="gsply">Export 3DGS PLY</button></div>
+  </details>
+
   <div id="stats">–</div>
 </div>
 
@@ -1289,6 +1311,29 @@ canvas.addEventListener("click", e=>{
 });
 $("calib").onclick = ()=>{ if(!$("calibbox")) openCalib(); };
 
+// ---------- パネル: 文脈に応じて無関係な行を隠す / 開閉を記憶 ----------
+function rowOf(id){ const el=$(id); return el ? el.closest(".row") : null; }
+function showRow(id, on){ const r=rowOf(id); if(r) r.hidden=!on; }
+function syncPanel(){
+  const orig = ui.scolor.value==="orig";
+  showRow("mode", orig); showRow("cmap", orig); showRow("autolvl", orig);
+  showRow("psize", ui.rmode.value!=="1" || ui.venuemode.value==="points");
+  showRow("radmul", ui.rmode.value==="1");
+  showRow("shade", ui.rmode.value!=="0");
+  for (const id of ["bxmin","bxmax","bymin","bymax"]) showRow(id, ui.clipon.checked);
+  showRow("vdim", ui.venuemode.value!=="off");
+  showRow("esize", ui.erase.checked); showRow("eundo", ui.erase.checked);
+  showRow("focustgt", ui.dof.checked); showRow("focus", ui.dof.checked && !ui.focustgt.checked); showRow("frange", ui.dof.checked);
+  showRow("voff", ui.vidon.checked); showRow("calib", ui.vidon.checked);
+}
+for (const id of ["scolor","rmode","venuemode","clipon","erase","dof","focustgt","vidon","scene"])
+  $(id).addEventListener("change", ()=>setTimeout(syncPanel,0));
+for (const d of document.querySelectorAll("#panel details")){
+  const key="panel."+d.dataset.sec;
+  try { const s=localStorage.getItem(key); if(s!==null) d.open = s==="1"; } catch(e){}
+  d.addEventListener("toggle", ()=>{ try{ localStorage.setItem(key, d.open?"1":"0"); }catch(e){} });
+}
+
 // ---------- メインループ ----------
 let RECSIZE = null;
 function resize(){
@@ -1541,6 +1586,7 @@ fetch("/info").then(r=>r.json()).then(info=>{
   loadVenue();
   ui.scene.onchange(); ui.scolor.onchange();     // 既定プリセットを実際の状態へ反映
   refreshEraseCount();
+  syncPanel();
   getFrame(0).then(()=>{ setPlaying(true); });
   requestAnimationFrame(loop);
 });
