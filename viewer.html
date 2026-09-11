@@ -81,7 +81,8 @@
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
   <div class="row"><label>Splat radius</label><input type="range" id="radmul" min="0.5" max="2.5" step="0.05" value="0.85"></div>
-  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.3" max="1" step="0.05" value="1"></div>
+  <div class="row"><label>Opacity</label><input type="range" id="opac" min="0.05" max="1" step="0.05" value="1"></div>
+  <div class="row"><label>Brightness</label><input type="range" id="bright" min="0.2" max="2.5" step="0.05" value="1"></div>
   <div class="row"><label>Shading</label><input type="range" id="shade" min="0" max="1" step="0.05" value="0.7"></div>
   <div class="row"><label>Temporal median</label>
     <select id="tmed">
@@ -215,12 +216,12 @@ void main(){
   gl_PointSize = clamp(s, 1.0, 30.0) * uDpr;
 }`,`#version 300 es
 precision highp float;
-in float vT; uniform int uCmap; out vec4 frag;
+in float vT; uniform int uCmap; uniform float uBright, uOpacity; out vec4 frag;
 ${CMAP_GLSL}
 void main(){
   vec2 d = gl_PointCoord - 0.5;
   if (dot(d,d) > 0.25) discard;
-  frag = vec4(cmap(uCmap, vT), 1.0);
+  frag = vec4(cmap(uCmap, vT) * uBright, uOpacity);
 }`);
 
 // サーフェル(楕円ガウシアン)スプラット描画
@@ -272,7 +273,7 @@ void main(){
 precision highp float;
 in float vT; in vec3 vC; in vec3 vN; in vec3 vE1; in vec3 vE2; in vec2 vSig; in vec3 vW;
 uniform vec2 uVp; uniform vec2 uPxy;
-uniform int uCmap; uniform float uOpacity; uniform float uShade;
+uniform int uCmap; uniform float uOpacity; uniform float uShade; uniform float uBright;
 uniform vec3 uLightDir;
 out vec4 frag;
 ${CMAP_GLSL}
@@ -317,7 +318,7 @@ void main(){
              + pow(1.0-ndv, 3.0) * 0.25 * vec3(0.55,0.68,1.0);
     col = mix(col, lit, uShade);
   }
-  frag = vec4(col * a, a);
+  frag = vec4(col * uBright * a, a);
 }`);
 
 // レンジ画像の格子をそのまま三角形に張り、SIGNAL/NIR等を貼るローポリメッシュ。
@@ -413,12 +414,12 @@ void main(){
   vCol = aCol;
 }`,`#version 300 es
 precision highp float;
-in vec3 vCol; uniform float uDim; uniform int uTint; out vec4 frag;
+in vec3 vCol; uniform float uDim, uBright, uOpacity; uniform int uTint; out vec4 frag;
 void main(){
   vec2 d = gl_PointCoord - 0.5;
   if (dot(d,d) > 0.25) discard;
   vec3 c = uTint==1 ? vec3(1.0) : uTint==2 ? vec3(dot(vCol, vec3(0.299,0.587,0.114))) : vCol;
-  frag = vec4(c * uDim, 1.0);
+  frag = vec4(c * uDim * uBright, uOpacity);
 }`);
 let vptVao=null, vptCount=0, vptLoading=false;
 function loadVenuePoints(){
@@ -742,7 +743,7 @@ const ui = {
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
   growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
-  scolor:$("scolor"),
+  scolor:$("scolor"), bright:$("bright"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -1181,9 +1182,13 @@ function loop(tms){
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDpr"), dpr);
     gl.uniform1f(gl.getUniformLocation(vptProg,"uDim"), +ui.vdim.value);
     gl.uniform1i(gl.getUniformLocation(vptProg,"uTint"), TINT);
+    gl.uniform1f(gl.getUniformLocation(vptProg,"uBright"), +ui.bright.value);
+    gl.uniform1f(gl.getUniformLocation(vptProg,"uOpacity"), +ui.opac.value);
+    if (+ui.opac.value < 1){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); }
     gl.bindVertexArray(vptVao);
     gl.drawArrays(gl.POINTS, 0, vptCount);
     gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
   } else if (venueVao && ui.venuemode.value==="mesh"){
     gl.useProgram(venueProg);
     gl.uniformMatrix4fv(gl.getUniformLocation(venueProg,"uProj"),false,proj);
@@ -1239,6 +1244,7 @@ function loop(tms){
       gl.uniformMatrix4fv(u("uView"),false,view);
       gl.uniform1f(u("uRadMul"), +ui.radmul.value);
       gl.uniform1f(u("uOpacity"), +ui.opac.value);
+      gl.uniform1f(u("uBright"), +ui.bright.value);
       gl.uniform1f(u("uShade"), +ui.shade.value);
       gl.uniform1f(u("uDynMin"), GROW > 0 ? 1.0 : +ui.dynmin.value);
       setProjUniforms(splatProg, 1);
@@ -1278,9 +1284,13 @@ function loop(tms){
       gl.uniform1i(u("uCmap"), +ui.cmap.value);
       gl.uniform1f(u("uLo"), levels.lo);
       gl.uniform1f(u("uHi"), levels.hi);
+      gl.uniform1f(u("uBright"), +ui.bright.value);
+      gl.uniform1f(u("uOpacity"), +ui.opac.value);
+      if (+ui.opac.value < 1){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); }
       gl.bindVertexArray(vao);
       gl.drawArrays(gl.POINTS,0,N);
       gl.bindVertexArray(null);
+      gl.disable(gl.BLEND);
     }
   }
 
