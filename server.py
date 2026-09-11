@@ -608,7 +608,21 @@ def build_venue():
     if "gs_pos" in z:
         gp = z["gs_pos"].astype(np.float32); gc = z["gs_rgb"]
         keep = ~erase_mask(gp.astype(np.float64), cfg)
-        gp = np.ascontiguousarray(gp[keep]); gc = np.ascontiguousarray(gc[keep])
+        gp = gp[keep]; gc = gc[keep]
+        th = cfg.get("thin")
+        if th:
+            # 密度の上限: 3DGSの床はスキャナの歩行経路に沿ってガウシアンが密集し、
+            # 白一色で描くと筋状に浮き出る。セルごとに点数を打ち切って一様にする。
+            cell = float(th.get("cell", 0.08)); K = int(th.get("max_per_cell", 3))
+            k = np.floor(gp / cell).astype(np.int64); k -= k.min(0)
+            lin = (k[:, 0] * (k[:, 1].max() + 1) + k[:, 1]) * (k[:, 2].max() + 1) + k[:, 2]
+            order = np.argsort(lin, kind="stable"); ls = lin[order]
+            first = np.r_[0, np.nonzero(np.diff(ls))[0] + 1]
+            cnt = np.diff(np.r_[first, len(ls)])
+            pos = np.arange(len(ls)) - np.repeat(first, cnt)
+            sel = np.zeros(len(gp), bool); sel[order[pos < K]] = True
+            gp = gp[sel]; gc = gc[sel]
+        gp = np.ascontiguousarray(gp); gc = np.ascontiguousarray(gc)
         VENUE_POINTS = b"".join([struct.pack("<4sI", b"VPT1", len(gp)), gp.tobytes(), gc.tobytes()])
         print(f"Venue points: {len(gp)} (erased {int((~keep).sum())})")
     v = z["verts"].astype(np.float32)
