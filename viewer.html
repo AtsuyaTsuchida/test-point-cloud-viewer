@@ -41,6 +41,13 @@
 <div id="panel">
   <h1 id="ttl">LiDAR Point Cloud Viewer</h1>
   <div class="sub" id="sub">Loading…</div>
+  <div class="row"><label>Scene</label>
+    <select id="scene">
+      <option value="mesh_splats" selected>Mesh venue + Splats</option>
+      <option value="points_all">Point cloud (all)</option>
+      <option value="points_splats">Point venue + Splats</option>
+      <option value="custom">Custom</option>
+    </select></div>
   <div class="row"><label>Render</label>
     <select id="rmode">
       <option value="1" selected>Splats</option>
@@ -724,7 +731,7 @@ const ui = {
   speed:$("speed"), time:$("time"), stats:$("stats"), buffering:$("buffering"),
   rmode:$("rmode"), radmul:$("radmul"), opac:$("opac"), shade:$("shade"),
   tmed:$("tmed"), venue:$("venue"), vdim:$("vdim"), dynmin:$("dynmin"),
-  growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"),
+  growm:$("growm"), vidon:$("vidon"), voff:$("voff"), venuemode:$("venuemode"), scene:$("scene"),
   reclen:$("reclen"), recbtn:$("recbtn"),
 };
 
@@ -773,6 +780,17 @@ function invalidate(){     // 前景抽出の条件が変わると全フレー�
 }
 ui.tmed.onchange = ()=>{ TMED = +ui.tmed.value; invalidate(); };
 ui.venuemode.onchange = ()=>{ ui.venue.checked = ui.venuemode.value!=="off"; if(ui.venuemode.value==="points") loadVenuePoints(); };
+// 会場と演奏者の描画モードを一括で切り替えるプリセット。個別に触ると Custom 表示になる。
+const SCENES = { mesh_splats:["mesh","1"], points_all:["points","0"], points_splats:["points","1"] };
+ui.scene.onchange = ()=>{
+  const s = SCENES[ui.scene.value]; if(!s) return;
+  ui.venuemode.value = s[0]; ui.venuemode.onchange();
+  ui.rmode.value = s[1];
+};
+for (const el of [ui.venuemode, ui.rmode]) el.addEventListener("change", ()=>{
+  const hit = Object.entries(SCENES).find(([k,s])=>s[0]===ui.venuemode.value && s[1]===ui.rmode.value);
+  ui.scene.value = hit ? hit[0] : "custom";
+});
 ui.dynmin.onchange = ()=>{ SEED = +ui.dynmin.value; meshFrame=-1; if(GROW>0) invalidate(); };
 ui.growm.onchange = ()=>{ GROW = +ui.growm.value; meshFrame=-1; invalidate(); };
 $("resetcam").onclick = resetCam;
