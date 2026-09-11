@@ -578,6 +578,7 @@ def load_venue():
 
 
 VIDEOS = {}              # name -> path (会場を撮った実写。射影テクスチャの素材)
+CALIB_DIR = os.path.join(HERE, "calib_data")   # ブラウザから受けた較正素材の置き場
 
 
 def find_videos():
@@ -659,6 +660,30 @@ def make_handler(src: OusterPcap):
                     self.wfile.write(chunk)
                     remain -= len(chunk)
 
+        # 較正用: ブラウザから映像の生画素(グレースケール)や動き系列を受け取る
+        def do_POST(self):
+            try:
+                u = urlparse(self.path)
+                n = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(n)
+                if u.path == "/calib/save":
+                    d = json.loads(body.decode("utf-8"))
+                    if not (isinstance(d.get("P"), list) and len(d["P"]) == 3):
+                        raise ValueError("bad P")
+                    with open(os.path.join(HERE, "calib.json"), "w") as fh:
+                        json.dump(d, fh, indent=1)
+                    self._send(200, "text/plain", b"calibration saved")
+                elif u.path == "/calib/upload":
+                    name = os.path.basename(parse_qs(u.query).get("name", ["blob"])[0])
+                    os.makedirs(CALIB_DIR, exist_ok=True)
+                    with open(os.path.join(CALIB_DIR, name), "wb") as fh:
+                        fh.write(body)
+                    self._send(200, "text/plain", f"saved {n} bytes".encode())
+                else:
+                    self._send(404, "text/plain", b"not found")
+            except Exception as e:
+                self._send(500, "text/plain", str(e).encode())
+
         def do_GET(self):
             try:
                 if self.path in ("/", "/index.html"):
@@ -666,6 +691,13 @@ def make_handler(src: OusterPcap):
                         self._send(200, "text/html; charset=utf-8", fh.read())
                 elif self.path == "/info":
                     self._send(200, "application/json", info_json)
+                elif urlparse(self.path).path == "/calib":
+                    p = os.path.join(HERE, "calib.json")
+                    if os.path.exists(p):
+                        with open(p, "rb") as fh:
+                            self._send(200, "application/json", fh.read())
+                    else:
+                        self._send(404, "text/plain", b"no calibration yet")
                 elif self.path == "/videos":
                     self._send(200, "application/json",
                                json.dumps(sorted(VIDEOS)).encode())

@@ -57,11 +57,12 @@
     </select></div>
   <div class="row"><label>Colormap</label>
     <select id="cmap">
-      <option value="0" selected>Magma</option>
+      <option value="0">Magma</option>
       <option value="1">Inferno</option>
       <option value="2">Viridis</option>
       <option value="3">Turbo</option>
       <option value="4">Gray</option>
+      <option value="5" selected>Flat (neutral)</option>
     </select></div>
   <div class="row"><label>Auto levels</label><input type="checkbox" id="autolvl" checked></div>
   <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="10" step="0.5" value="3"></div>
@@ -82,7 +83,7 @@
   <div class="row"><label>Foreground ≥ cm</label><input type="range" id="dynmin" min="0" max="60" step="5" value="15"></div>
   <div class="row"><label>Cluster grow m</label><input type="range" id="growm" min="0" max="3" step="0.2" value="1.0"></div>
   <div class="row"><label>Project video</label><input type="checkbox" id="vidon"></div>
-  <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="0"></div>
+  <div class="row"><label>Video offset s</label><input type="range" id="voff" min="-60" max="60" step="0.5" value="-38.5"></div>
   <div class="row"><button id="calib" style="width:100%">Calibrate camera…</button></div>
   <div class="row"><label>Record</label>
     <select id="reclen">
@@ -170,6 +171,7 @@ vec3 cmap(int c, float t){
   if(c==1) return inferno(t);
   if(c==2) return viridis(t);
   if(c==3) return turbo(t);
+  if(c==5) return vec3(0.62, 0.56, 0.50) * (0.75 + 0.5*t);   // 会場の木質色に寄せた無彩色。反射率で僅かに濃淡
   return vec3(t);}
 `;
 
@@ -928,7 +930,7 @@ function calibResidual(P, pairs){
 // 映像テクスチャと較正UI
 function setupVideo(){
   vidEl = document.createElement("video");
-  vidEl.src = "/video/honsen%20M5.mp4";     // 固定カメラなので一度の較正で全編に使える
+  vidEl.src = "/video/honsen%20M5.mp4";     // 固定カメラ(M5)なので一度の較正で全編に使える
   vidEl.muted = true; vidEl.playsInline = true; vidEl.preload = "auto";
   vidTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, vidTex);
@@ -939,6 +941,12 @@ function setupVideo(){
   gl.bindTexture(gl.TEXTURE_2D, null);
   const saved = localStorage.getItem("pmat");
   if (saved) { try { PMAT = JSON.parse(saved); } catch(e){} }
+  // サーバー側で自動較正した結果があればそれを優先する (射影行列と時刻オフセット)
+  fetch("/calib?v="+INFO.gen).then(r=>r.ok?r.json():null).then(c=>{
+    if(!c) return;
+    PMAT = c.P; ui.voff.value = c.offset_s; ui.vidon.checked = true;
+    console.log("calibration loaded", c);
+  }).catch(()=>{});
 }
 function syncVideo(){
   if (!vidEl || !INFO) return;
@@ -1011,7 +1019,8 @@ function openCalib(){
   });
   $("csolve").onclick=()=>{ const P=solveDLT(calibPairs);
     if(!P){ alert("6組以上必要です"); return; }
-    PMAT=P; localStorage.setItem("pmat",JSON.stringify(P)); ui.vidon.checked=true; st(); };
+    PMAT=P; localStorage.setItem("pmat",JSON.stringify(P)); ui.vidon.checked=true; st();
+    fetch("/calib/save",{method:"POST",body:JSON.stringify({P:P, offset_s:+ui.voff.value, method:"manual", pairs:calibPairs})}).catch(()=>{}); };
   $("cundo").onclick=()=>{ calibPairs.pop(); st(); };
   $("cclear").onclick=()=>{ calibPairs.length=0; pendingUV=null; PMAT=null;
     localStorage.removeItem("pmat"); st(); };
